@@ -1,0 +1,45 @@
+name: 1. 核弹清空 (Delete All)
+
+on: workflow_dispatch
+
+jobs:
+  delete-everything:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. 检查密码 (Debug)
+        env:
+          TEST_KEY: ${{ secrets.MY_PAT }}
+        run: |
+          if [ -z "$TEST_KEY" ]; then
+            echo "❌ 严重错误：密码是空的！"
+            echo "原因：Secrets 里的名字可能写错了（比如多了空格），或者没存对位置。"
+            exit 1
+          else
+            echo "✅ 密码检查通过，开始干活..."
+          fi
+
+      - name: 2. 执行清空
+        env:
+          GH_TOKEN: ${{ secrets.MY_PAT }}
+          SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
+        run: |
+          echo "🗑️ 正在查找您仓库里所有 CMFA- 开头的版本..."
+          
+          # 列出所有 CMFA- 开头的 release
+          gh release list --limit 100 | grep "CMFA-" | awk '{print $1}' > delete_list.txt
+          
+          TOTAL=$(wc -l < delete_list.txt)
+          if [ "$TOTAL" -eq "0" ]; then
+             echo "✨ 仓库已经很干净，没有什么可删的。"
+             exit 0
+          fi
+          
+          echo "⚠️ 发现 $TOTAL 个旧版本，准备全部删除..."
+          
+          while read TAG; do
+            echo "🔥 正在删除: $TAG"
+            # --cleanup-tag 会连同标签一起删掉，确保彻底消失
+            gh release delete $TAG --cleanup-tag --yes || true
+          done < delete_list.txt
+          
+          echo "✅ 全部清空完毕！现在请去运行【完美排序版】脚本。"
