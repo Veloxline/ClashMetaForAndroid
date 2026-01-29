@@ -1,4 +1,4 @@
-name: 2. 纯净搬运 (最终稳定版)
+name: 2. 纯净搬运 (物理隔离版)
 
 on:
   schedule:
@@ -6,90 +6,139 @@ on:
   workflow_dispatch:
 
 jobs:
-  stable-sync:
+  isolation-sync:
     runs-on: ubuntu-latest
     steps:
       - name: 初始化
         uses: actions/checkout@v4
 
-      - name: 执行搬运
+      - name: 1. 获取并拆分列表
         env:
           GH_TOKEN: ${{ secrets.MY_PAT }}
           SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
         run: |
           mkdir -p download_temp
           
-          echo "🔍 1. 获取列表..."
+          echo "🔍 获取原始列表..."
           gh release list -R $SOURCE_REPO --limit 100 --json tagName -q '.[].tagName' | grep "^v" > raw.txt
           
-          echo "🧮 2. Python 排序 (v2.9 -> v2.11)..."
+          echo "🧮 Python 精准排序..."
+          # 排序逻辑：将 v2.11.9 转换为 [2, 11, 9] 进行比较
           python3 -c "
           import sys
           lines = [l.strip() for l in open('raw.txt') if l.strip()]
-          # 排序: v2.11.9 -> [2, 11, 9]
           def sort_key(s):
               nums = s.lstrip('v').split('-')[0].split('.')
               return [int(x) for x in nums if x.isdigit()]
           lines.sort(key=sort_key)
           print('\n'.join(lines))
-          " > tags.txt
+          " > sorted_tags.txt
           
-          # 锁定最后一行 (最新版)
-          KING_TAG=$(tail -n 1 tags.txt)
-          echo "🎯 锁定最新版 (King): $KING_TAG"
+          # --- 物理拆分 ---
+          # 1. 提取最后一行作为 King (最新版)
+          tail -n 1 sorted_tags.txt > king.txt
+          KING_TAG=$(cat king.txt)
           
-          TOTAL=$(wc -l < tags.txt)
+          # 2. 提取除了最后一行之外的所有行作为 Commoners (旧版本)
+          head -n -1 sorted_tags.txt > commoners.txt
+          
+          echo "========================================"
+          echo "👑 唯一的王 (King): $KING_TAG"
+          echo "👥 旧版本数量: $(wc -l < commoners.txt)"
+          echo "========================================"
+
+      - name: 2. 批量处理旧版本 (强制非 Latest)
+        env:
+          GH_TOKEN: ${{ secrets.MY_PAT }}
+          SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
+        run: |
+          # 关闭错误中断，确保持续执行
+          set +e
+          
+          TOTAL=$(wc -l < commoners.txt)
           CURRENT=0
+          
+          echo "🚀 开始处理旧版本 (Commoners)..."
           
           while read TAG; do
             CURRENT=$((CURRENT+1))
             NEW_TAG="CMFA-$TAG"
             
-            # --- 查重 ---
-            if gh release view $NEW_TAG > /dev/null 2>&1; then
-              echo "[$CURRENT/$TOTAL] ✅ $NEW_TAG 已存在，跳过。"
+            # 查重
+            gh release view $NEW_TAG > /dev/null 2>&1
+            if [ $? -eq 0 ]; then
+              echo "[$CURRENT/$TOTAL] ⏭️ $NEW_TAG 已存在，跳过。"
               continue
             fi
             
-            echo "🚀 [$CURRENT/$TOTAL] 正在搬运: $TAG"
+            echo "Processing [$CURRENT/$TOTAL]: $TAG"
             
-            # 1. 准备日志
+            # 准备日志
             gh release view $TAG -R $SOURCE_REPO --json publishedAt,body > meta.json
+            if [ $? -ne 0 ]; then echo "⚠️ 获取信息失败，跳过"; continue; fi
+            
             ORIG_DATE=$(jq -r .publishedAt meta.json)
             NICE_DATE=$(date -d "$ORIG_DATE" +'%Y-%m-%d %H:%M')
             echo -e "### 📅 原版发布时间: **$NICE_DATE**\n\n---" > notes.md
             jq -r .body meta.json >> notes.md
             
-            # 2. 下载 (忽略错误)
+            # 下载
             rm -rf download_temp/*
-            gh release download $TAG -R $SOURCE_REPO -D download_temp 2>/dev/null || true
+            gh release download $TAG -R $SOURCE_REPO -D download_temp 2>/dev/null
             
-            # 3. 决定身份 (是否为 King)
-            if [ "$TAG" == "$KING_TAG" ]; then
-               LATEST_FLAG="--make-latest"
-               echo "👑 身份确认：这是最新版！"
-            else
-               LATEST_FLAG="--latest=false"
-            fi
+            # 📤 上传 (核心：强制 --latest=false)
+            echo "📤 上传旧版本 (Force Non-Latest)..."
             
-            # 4. 上传 (关键修复：严谨判断文件是否存在)
-            # 使用 ls -A 判断目录是否为空
+            # 检测是否有文件 (修复崩溃 BUG)
             if [ -n "$(ls -A download_temp 2>/dev/null)" ]; then
-               # 有文件 -> 带文件上传
-               echo "📂 发现附件，正在上传..."
-               gh release create "$NEW_TAG" download_temp/* --title "CMFA: $TAG" -F notes.md $LATEST_FLAG
+               gh release create "$NEW_TAG" download_temp/* --title "CMFA: $TAG" -F notes.md --latest=false
             else
-               # 无文件 -> 纯文本发布 (防止崩溃!)
-               echo "⚠️ 无附件，仅创建 Release..."
-               gh release create "$NEW_TAG" --title "CMFA: $TAG (无附件)" -F notes.md $LATEST_FLAG
+               gh release create "$NEW_TAG" --title "CMFA: $TAG (无附件)" -F notes.md --latest=false
             fi
             
-            echo "✅ $NEW_TAG 完成"
+            # 稍微休息，虽然不重要了，但防风控
+            sleep 1
             
-            # 睡眠 3 秒
-            sleep 3
-            
-          done < tags.txt
+          done < commoners.txt
+          echo "✅ 所有旧版本处理完毕！"
+
+      - name: 3. 独家加冕 (处理 King)
+        env:
+          GH_TOKEN: ${{ secrets.MY_PAT }}
+          SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
+        run: |
+          KING_TAG=$(cat king.txt)
+          NEW_TAG="CMFA-$KING_TAG"
           
-          rm -rf download_temp tags.txt raw.txt meta.json notes.md
-          echo "🏁 搬运完成！"
+          echo "----------------------------------------"
+          echo "👑 正在迎接新王: $KING_TAG"
+          echo "----------------------------------------"
+          
+          # 准备日志
+          gh release view $KING_TAG -R $SOURCE_REPO --json publishedAt,body > meta.json
+          ORIG_DATE=$(jq -r .publishedAt meta.json)
+          NICE_DATE=$(date -d "$ORIG_DATE" +'%Y-%m-%d %H:%M')
+          echo -e "### 📅 原版发布时间: **$NICE_DATE**\n\n---" > notes.md
+          jq -r .body meta.json >> notes.md
+          
+          # 下载
+          rm -rf download_temp/*
+          gh release download $KING_TAG -R $SOURCE_REPO -D download_temp 2>/dev/null
+          
+          # 📤 上传 (核心：强制 --make-latest)
+          # 即使它已经存在，我们也要 edit 它成为 latest
+          
+          if gh release view $NEW_TAG > /dev/null 2>&1; then
+             echo "⚠️ $NEW_TAG 已存在，正在强制加冕..."
+             gh release edit "$NEW_TAG" --make-latest
+          else
+             echo "📤 创建并加冕..."
+             if [ -n "$(ls -A download_temp 2>/dev/null)" ]; then
+                gh release create "$NEW_TAG" download_temp/* --title "CMFA: $KING_TAG" -F notes.md --make-latest
+             else
+                gh release create "$NEW_TAG" --title "CMFA: $KING_TAG (无附件)" -F notes.md --make-latest
+             fi
+          fi
+          
+          echo "🎉 完美收官！$KING_TAG 现已登基。"
+          rm -rf download_temp raw.txt sorted_tags.txt commoners.txt king.txt meta.json notes.md
