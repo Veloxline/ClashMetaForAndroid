@@ -1,4 +1,4 @@
-name: 2. 纯净搬运 (Python数学排序版)
+name: 2. 纯净搬运 (时间轴复刻版)
 
 on:
   schedule:
@@ -6,54 +6,66 @@ on:
   workflow_dispatch:
 
 jobs:
-  python-sort-sync:
+  timeline-sync:
     runs-on: ubuntu-latest
     steps:
       - name: 初始化
         uses: actions/checkout@v4
 
-      - name: 执行搬运
+      - name: 执行时间轴搬运
         env:
           GH_TOKEN: ${{ secrets.MY_PAT }}
           SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
         run: |
           mkdir -p download_temp
           
-          echo "🔍 获取列表..."
-          # 先获取所有 v 开头的版本，暂存到文件中
-          gh release list -R $SOURCE_REPO --limit 100 --json tagName -q '.[].tagName' | grep "^v" > raw_tags.txt
+          echo "🔍 获取元数据 (包含发布日期)..."
           
-          echo "🧮 正在使用 Python 进行严格数学排序..."
+          # 1. 直接获取 JSON 数据 (包含 tagName 和 publishedAt 时间)
+          gh release list -R $SOURCE_REPO --limit 100 --json tagName,publishedAt > releases.json
           
-          # --- 核心必杀技：Python 排序 ---
-          # 这段 Python 代码会把 "v2.9" 和 "v2.11" 真正按数字大小排列
-          # 结果保证是：v2.9 -> v2.10 -> v2.11
+          echo "📅 正在根据【原版发布时间】进行排序..."
+          
+          # --- 核心：Python 时间排序 ---
+          # 不再看版本号是 2.9 还是 2.11
+          # 只看：谁的时间早，谁就排前面
           python3 -c "
-          import sys
-          # 读取所有行
-          lines = [l.strip() for l in open('raw_tags.txt') if l.strip()]
-          # 排序函数：去掉 'v'，按 '.' 分割，转成数字列表进行比较
-          # 例如 v2.11.22 -> [2, 11, 22]
-          lines.sort(key=lambda s: [int(u) for u in s.lstrip('v').split('.') if u.isdigit()])
-          # 打印结果
-          print('\n'.join(lines))
+          import json, sys
+          from datetime import datetime
+          
+          # 读取 JSON
+          with open('releases.json', 'r') as f:
+              data = json.load(f)
+          
+          # 过滤掉非 v 开头的 (保留正式版)
+          # data = [item for item in data if item['tagName'].startswith('v')]
+          # 如果您想保留 v 开头的逻辑，取消上面注释。但按时间排通常不需要过滤，下面逻辑是全量排序。
+          # 为了保险，还是加上过滤 v 开头，防止奇怪的 tag 混入
+          data = [item for item in data if item['tagName'].startswith('v')]
+          
+          # 按 publishedAt 字符串排序 (ISO格式可以直接通过字符串排序: 2023 < 2025)
+          # reverse=False (从小到大: 旧 -> 新)
+          data.sort(key=lambda x: x['publishedAt'])
+          
+          # 输出排序后的 tag
+          for item in data:
+              print(item['tagName'])
           " > tags.txt
           
-          # 检查排序结果（调试用）
-          echo "📊 排序预览 (头部-旧):"
-          head -n 3 tags.txt
-          echo "..."
-          echo "📊 排序预览 (尾部-新):"
-          tail -n 3 tags.txt
+          # 检查排序结果 (给您吃定心丸)
+          echo "----------------------------------------"
+          echo "📊 搬运顺序预演:"
+          echo "➡️ 第一个搬 (最旧): $(head -n 1 tags.txt)"
+          echo "➡️ 最后一个搬 (最新): $(tail -n 1 tags.txt)"
+          echo "----------------------------------------"
           
           if [ ! -s tags.txt ]; then
-             echo "❌ 列表为空，终止。"
+             echo "❌ 列表为空！"
              exit 1
           fi
 
-          # 锁定列表中最后一个版本 (Python 排完序后，最后一个一定是最大的)
+          # 锁定最新的那个 tag
           LATEST_TARGET=$(tail -n 1 tags.txt)
-          echo "🎯 锁定真·最新版本: $LATEST_TARGET"
           
           TOTAL=$(wc -l < tags.txt)
           CURRENT=0
@@ -68,27 +80,24 @@ jobs:
               continue
             fi
             
-            echo "----------------------------------------"
             echo "🚀 [$CURRENT/$TOTAL] 正在搬运: $TAG"
             
-            # 1. 抓取时间
-            RAW_DATE=$(gh release view $TAG -R $SOURCE_REPO --json publishedAt -q .publishedAt 2>/dev/null) || true
-            if [ -n "$RAW_DATE" ]; then
-                NICE_DATE=$(date -d "$RAW_DATE" +'%Y-%m-%d %H:%M')
-            else
-                NICE_DATE="Unknown"
-            fi
+            # 准备日志
+            # 这里获取时间和日志
+            gh release view $TAG -R $SOURCE_REPO --json publishedAt,body > meta.json
             
-            # 2. 准备日志
-            gh release view $TAG -R $SOURCE_REPO --json body -q .body > logs.txt
+            # 解析时间
+            RAW_DATE=$(jq -r .publishedAt meta.json)
+            NICE_DATE=$(date -d "$RAW_DATE" +'%Y-%m-%d %H:%M')
+            
             echo -e "### 📅 原版发布时间: **$NICE_DATE**\n\n---" > notes.md
-            cat logs.txt >> notes.md
+            jq -r .body meta.json >> notes.md
             
-            # 3. 下载
+            # 下载
             rm -rf download_temp/*
             gh release download $TAG -R $SOURCE_REPO -D download_temp 2>/dev/null || true
             
-            # 4. 上传 (先不标记 Latest)
+            # 上传 (暂时都设为 latest=false)
             if [ "$(ls -A download_temp)" ]; then
                gh release create $NEW_TAG download_temp/* --title "CMFA: $TAG" -F notes.md --latest=false
             else
@@ -97,17 +106,17 @@ jobs:
             
             echo "✅ $NEW_TAG 完成"
             
-            # 🟢 强制睡眠 3 秒 (确保 v2.11 的创建时间确实比 v2.9 晚)
+            # 🟢 强制睡眠 3 秒 (确保时间戳从旧到新排列)
             sleep 3
             
           done < tags.txt
           
-          # --- 终极修正：把皇冠戴在真正的王者头上 ---
+          # --- 终极修正 ---
           if [ ! -z "$LATEST_TARGET" ]; then
             FINAL_TAG="CMFA-$LATEST_TARGET"
-            echo "👑 正在强制将 $FINAL_TAG 设为 Latest..."
-            gh release edit "$FINAL_TAG" --make-latest || echo "⚠️ 标记失败"
+            echo "👑 强制将 $FINAL_TAG 设为 Latest..."
+            gh release edit "$FINAL_TAG" --make-latest || true
           fi
           
-          rm -rf download_temp tags.txt raw_tags.txt logs.txt notes.md
-          echo "🏁 完美收官！"
+          rm -rf download_temp tags.txt releases.json meta.json notes.md
+          echo "🏁 时间轴复刻完成！"
