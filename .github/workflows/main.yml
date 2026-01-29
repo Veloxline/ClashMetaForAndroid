@@ -1,4 +1,4 @@
-name: 2. 纯净搬运 (ID修正时光机)
+name: 2. 纯净搬运 (智能死磕版)
 
 on:
   schedule:
@@ -6,27 +6,26 @@ on:
   workflow_dispatch:
 
 jobs:
-  time-travel-id-fix:
+  smart-retry-sync:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # 必须有写入权限
+      contents: write # 必须有权限修改 Release
     steps:
       - name: 初始化
         uses: actions/checkout@v4
 
-      - name: 执行搬运并篡改时间
+      - name: 执行搬运
         env:
           GH_TOKEN: ${{ secrets.MY_PAT }}
           SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
         run: |
-          # 1. 获取当前仓库的 owner/repo 格式
+          # 1. 锁定仓库信息
           MY_REPO=$(gh repo view --json owner,name -q ".owner.login + \"/\" + .name")
-          echo "📍 锁定当前仓库: $MY_REPO"
+          echo "📍 目标仓库: $MY_REPO"
           
           mkdir -p download_temp
           
           echo "🔍 获取原始列表..."
-          # 获取列表，只保留 v 开头
           gh release list -R $SOURCE_REPO --limit 100 --json tagName -q '.[].tagName' | grep "^v" > tags.txt
           
           TOTAL=$(wc -l < tags.txt)
@@ -45,7 +44,7 @@ jobs:
             echo "----------------------------------------"
             echo "🚀 [$CURRENT/$TOTAL] 正在搬运: $TAG"
             
-            # 1. 抓取原版精确时间
+            # 1. 抓取原版时间
             gh release view $TAG -R $SOURCE_REPO --json publishedAt,body > meta.json
             ORIG_DATE=$(jq -r .publishedAt meta.json)
             NICE_DATE=$(date -d "$ORIG_DATE" +'%Y-%m-%d %H:%M')
@@ -57,33 +56,63 @@ jobs:
             rm -rf download_temp/*
             gh release download $TAG -R $SOURCE_REPO -D download_temp 2>/dev/null || true
             
-            # 3. 创建发布 (此时时间是“现在”)
+            # 3. 创建发布
+            echo "📤 上传发布..."
             if [ "$(ls -A download_temp)" ]; then
                gh release create $NEW_TAG download_temp/* --title "CMFA: $TAG" -F notes.md --latest=false
             else
                gh release create $NEW_TAG --title "CMFA: $TAG (无附件)" -F notes.md --latest=false
             fi
             
-            # 🟢 4. 核心修正：获取 Release ID 并通过 ID 修改时间
-            # 这是解决 404 错误的唯一办法
-            echo "🔍 正在查询 $NEW_TAG 的唯一 ID..."
-            RELEASE_ID=$(gh release view "$NEW_TAG" --json databaseId -q .databaseId)
+            # 🟢 4. 智能死磕获取 ID (核心修改)
+            echo "🔍 正在查询 ID (启动重试机制)..."
+            RELEASE_ID=""
             
-            echo "🔧 正在将 ID:$RELEASE_ID 的时间修正为: $ORIG_DATE"
-            gh api --method PATCH "/repos/$MY_REPO/releases/$RELEASE_ID" -f published_at="$ORIG_DATE"
+            # 循环 20 次，每次 5 秒，总共给 GitHub 100 秒的反应时间
+            for i in {1..20}; do
+              # 尝试获取 ID
+              RELEASE_ID=$(gh release view "$NEW_TAG" --json databaseId -q .databaseId 2>/dev/null || true)
+              
+              if [ -n "$RELEASE_ID" ]; then
+                echo "🎉 成功获取 ID: $RELEASE_ID (耗时: $((i*5))秒内)"
+                break
+              fi
+              
+              echo "⏳ [$i/20] 暂未查到 ID，GitHub 数据尚未同步，等待 5 秒..."
+              sleep 5
+            done
             
-            echo "✅ $NEW_TAG 完成 (时间已穿越)"
+            # 如果死磕了 100 秒还是空的，那就真的没办法了
+            if [ -z "$RELEASE_ID" ]; then
+              echo "❌ 严重错误：重试 20 次仍无法获取 ID，$NEW_TAG 时间修正失败！"
+            else
+              # 5. 修改时间
+              echo "🔧 修正时间戳 -> $ORIG_DATE"
+              gh api --method PATCH "/repos/$MY_REPO/releases/$RELEASE_ID" -f published_at="$ORIG_DATE"
+              echo "✅ 完成！"
+            fi
             
           done < tags.txt
           
-          # --- 5. 自动加冕最新版 ---
-          # 由于我们恢复了真实时间，GitHub 应该能自动识别，但为了保险还是手动标记一下
-          echo "👑 正在刷新 Latest 状态..."
-          LATEST_TAG=$(gh release list --limit 1 --exclude-drafts --exclude-pre-releases --json tagName -q '.[0].tagName')
+          # --- 6. 自动加冕 ---
+          echo "👑 正在计算最新版本..."
+          # 获取所有 tags，用 Python 算出最大的版本号
+          gh release list --limit 100 --json tagName -q '.[].tagName' | grep "^CMFA-v" > all_tags.txt
+          
+          LATEST_TAG=$(python3 -c "
+          import sys
+          lines = [l.strip() for l in open('all_tags.txt') if l.strip()]
+          def sort_key(s):
+              nums = s.replace('CMFA-v', '').split('-')[0].split('.')
+              return [int(x) for x in nums if x.isdigit()]
+          lines.sort(key=sort_key)
+          if lines: print(lines[-1])
+          ")
+          
           if [ ! -z "$LATEST_TAG" ]; then
-             echo "🎯 检测到最新版是 $LATEST_TAG，正在加冕..."
-             gh release edit "$LATEST_TAG" --make-latest || true
+             echo "🎯 锁定新王: $LATEST_TAG"
+             gh release edit "$LATEST_TAG" --make-latest
           fi
           
-          rm -rf download_temp tags.txt meta.json notes.md
-          echo "🏁 完美收官！"
+          rm -rf download_temp tags.txt meta.json notes.md all_tags.txt
+          echo "🏁 所有任务结束！"
