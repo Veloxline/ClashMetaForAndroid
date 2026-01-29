@@ -1,0 +1,86 @@
+name: 全量档案馆 (CMFA命名版)
+
+on:
+  schedule:
+    - cron: '0 */12 * * *'
+  workflow_dispatch:
+
+jobs:
+  archive-cmfa:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. 初始化 Git 环境
+        uses: actions/checkout@v4
+
+      - name: 2. 执行全量搬运
+        env:
+          GH_TOKEN: ${{ secrets.MY_PAT }}
+          SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
+        run: |
+          mkdir -p download_temp
+          
+          echo "🔍 正在获取最近 100 个版本列表..."
+          gh release list -R $SOURCE_REPO --limit 100 | awk '{print $1}' > tags.txt
+          
+          while read TAG; do
+            # 🟢 修改点：前缀改为 CMFA-
+            NEW_TAG="CMFA-$TAG"
+            
+            # --- 1. 查重 ---
+            if gh release view $NEW_TAG > /dev/null 2>&1; then
+              echo "✅ [已存档] $NEW_TAG 跳过。"
+              continue
+            fi
+            
+            echo "----------------------------------------"
+            echo "🚀 正在处理: $TAG"
+            
+            # --- 2. 抓取元数据 ---
+            echo "📝 尝试获取原版信息..."
+            
+            # 防崩溃机制：如果原版被删，跳过
+            if ! RAW_DATE=$(gh release view $TAG -R $SOURCE_REPO --json publishedAt -q .publishedAt 2>/dev/null); then
+               echo "⚠️ 警告: 原版 $TAG 无法读取，跳过！"
+               continue
+            fi
+            
+            # 格式化日期
+            NICE_DATE=$(date -d "$RAW_DATE" +'%Y-%m-%d %H:%M')
+            
+            # 获取日志
+            gh release view $TAG -R $SOURCE_REPO --json body -q .body > original_log.txt
+            
+            echo -e "### 📅 原版发布时间: **$NICE_DATE**\n\n---" > notes.md
+            cat original_log.txt >> notes.md
+            
+            
+            # --- 3. 下载资源 ---
+            echo "📥 下载附件中..."
+            rm -rf download_temp/*
+            
+            # 尝试下载
+            if ! gh release download $TAG -R $SOURCE_REPO -D download_temp 2>/dev/null; then
+               echo "⚠️ 警告: $TAG 下载失败或无附件..."
+            fi
+            
+            
+            # --- 4. 上传发布 ---
+            echo "📤 正在上传到 $NEW_TAG ..."
+            
+            if [ "$(ls -A download_temp)" ]; then
+               # 🟢 修改点：标题前缀也改为 CMFA
+               gh release create $NEW_TAG download_temp/* --title "CMFA: $TAG" -F notes.md
+               echo "🎉 成功归档: $NEW_TAG"
+            else
+               # 🟢 修改点：标题前缀也改为 CMFA
+               gh release create $NEW_TAG --title "CMFA: $TAG (无附件)" -F notes.md
+               echo "⚠️ 归档了无附件版本: $NEW_TAG"
+            fi
+            
+            # 清理
+            rm -f notes.md original_log.txt
+            
+          done < tags.txt
+          
+          rm -rf download_temp tags.txt
+          echo "🏁 所有任务结束！"
