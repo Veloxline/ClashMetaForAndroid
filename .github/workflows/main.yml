@@ -1,4 +1,4 @@
-name: 2. 纯净搬运 (草稿流水线版)
+name: 2. 纯净搬运 (原子修复版)
 
 on:
   schedule:
@@ -6,23 +6,30 @@ on:
   workflow_dispatch:
 
 jobs:
-  draft-assembly-sync:
+  atomic-restore-sync:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # 必须有权限修改 Release
     steps:
       - name: 初始化
         uses: actions/checkout@v4
 
-      - name: 1. 准备清单
+      - name: 1. 准备清单与环境
         env:
           GH_TOKEN: ${{ secrets.MY_PAT }}
           SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
         run: |
           mkdir -p download_temp
           
+          # 获取当前仓库 owner/repo
+          MY_REPO=$(gh repo view --json owner,name -q ".owner.login + \"/\" + .name")
+          echo "REPO_PATH=$MY_REPO" >> $GITHUB_ENV
+          echo "📍 当前仓库: $MY_REPO"
+          
           echo "🔍 获取全量列表..."
           gh release list -R $SOURCE_REPO --limit 100 --json tagName -q '.[].tagName' | grep "^v" > raw.txt
           
-          echo "🧮 Python 智能排序 (确保从小到大)..."
+          echo "🧮 Python 排序..."
           python3 -c "
           import sys
           lines = [l.strip() for l in open('raw.txt') if l.strip()]
@@ -33,47 +40,48 @@ jobs:
           print('\n'.join(lines))
           " > tags.txt
           
-          # 锁定 King (最新版)
+          # 锁定 King
           KING_TAG=$(tail -n 1 tags.txt)
           echo "KING_TAG=$KING_TAG" >> $GITHUB_ENV
-          echo "👑 锁定的新王: $KING_TAG"
+          echo "👑 目标新王: $KING_TAG"
 
-      - name: 2.【进货阶段】全部上传为草稿 (Draft)
+      - name: 2.【进货】上传所有草稿
         env:
           GH_TOKEN: ${{ secrets.MY_PAT }}
           SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
         run: |
-          set +e # 允许报错继续，保证尽可能多的文件上传成功
-          
+          set +e
           TOTAL=$(wc -l < tags.txt)
           CURRENT=0
           
-          echo "📦 开始进货：所有版本将先作为【草稿】上传..."
-          
+          echo "📦 开始上传草稿..."
           while read TAG; do
             CURRENT=$((CURRENT+1))
             NEW_TAG="CMFA-$TAG"
             
-            # 查重 (如果已经是正式版或草稿，都跳过)
+            # 查重
             if gh release view $NEW_TAG > /dev/null 2>&1; then
-               echo "⏭️ $NEW_TAG 已存在，跳过。"
+               echo "⏭️ $NEW_TAG 已存在"
                continue
             fi
             
-            echo "📥 [$CURRENT/$TOTAL] 下载并上传草稿: $TAG"
+            echo "📥 [$CURRENT/$TOTAL] 上传草稿: $TAG"
             
-            # 准备笔记
+            # 抓取元数据
             gh release view $TAG -R $SOURCE_REPO --json publishedAt,body > meta.json
             if [ $? -ne 0 ]; then continue; fi
+            
+            # 保存原始时间到文件，供下一步使用
             ORIG_DATE=$(jq -r .publishedAt meta.json)
-            echo -e "### 📅 原版发布时间: **$ORIG_DATE**\n\n---" > notes.md
-            jq -r .body meta.json >> notes.md
+            echo "$ORIG_DATE" > "date_$TAG.txt"
+            
+            jq -r .body meta.json > notes.md
             
             # 下载
             rm -rf download_temp/*
             gh release download $TAG -R $SOURCE_REPO -D download_temp 2>/dev/null
             
-            # 🟢 核心：上传为 Draft (公众不可见，无时间戳负担)
+            # 上传为 Draft
             if [ -n "$(ls -A download_temp 2>/dev/null)" ]; then
                gh release create "$NEW_TAG" download_temp/* --title "CMFA: $TAG" -F notes.md --draft
             else
@@ -81,52 +89,92 @@ jobs:
             fi
             
           done < tags.txt
-          echo "✅ 进货完成！所有版本现已静静躺在 Draft 列表中。"
+          
+          echo "✅ 所有草稿上传完毕。休息 10 秒等待数据库同步..."
+          sleep 10
 
-      - name: 3.【上架阶段】按顺序发布 (Publish)
+      - name: 3.【原子发布】API 强制修正
         env:
           GH_TOKEN: ${{ secrets.MY_PAT }}
-          SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
         run: |
-          set +e
+          # 使用 Python 处理 API 请求，比 Shell 更稳定
+          python3 -c "
+          import os
+          import subprocess
+          import time
+          import json
           
-          echo "🚀 开始上架：按严格顺序将草稿转为正式版..."
+          repo_path = os.environ['REPO_PATH']
+          king_tag = os.environ['KING_TAG']
           
-          while read TAG; do
-            NEW_TAG="CMFA-$TAG"
-            
-            echo "----------------------------------------"
-            echo "📢 正在发布: $NEW_TAG"
-            
-            # 判断是否为 King
-            EXTRA_FLAGS=""
-            if [ "$TAG" == "$KING_TAG" ]; then
-               # 如果是 King，赋予 Latest 皇冠
-               EXTRA_FLAGS="--make-latest"
-               echo "👑 它是新王！将标记为 Latest。"
-            else
-               # 如果是普通版本，显式标记为非 Latest
-               EXTRA_FLAGS="--latest=false"
-            fi
-            
-            # 🟢 核心：将 Draft 转为 Public
-            # 这一步瞬间完成，正是这一瞬间决定了 GitHub 的时间排序
-            gh release edit "$NEW_TAG" --draft=false $EXTRA_FLAGS
-            
-            if [ $? -eq 0 ]; then
-                echo "✅ 发布成功"
-            else
-                echo "⚠️ 发布失败 (可能是草稿不存在)，尝试直接创建..."
-                # 补救措施：如果草稿没找到，尝试直接创建一个空的 Release 占位
-                gh release create "$NEW_TAG" --title "CMFA: $TAG (补救)" --notes "原版发布时间见标题" $EXTRA_FLAGS
-            fi
-            
-            # 🟢 物理间隔：确保时间戳不重叠
-            # 2秒足够了，因为 API 响应本身就有延迟
-            echo "⏳ 间隔 3 秒..."
-            sleep 3
-            
-          done < tags.txt
+          # 读取 tags
+          with open('tags.txt', 'r') as f:
+              tags = [line.strip() for line in f if line.strip()]
           
-          echo "🏁 完美收官！请查看 Releases 页面。"
-          rm -rf download_temp tags.txt raw.txt meta.json notes.md
+          print(f'🚀 开始原子发布流程，目标仓库: {repo_path}')
+          print(f'👑 King Tag: {king_tag}')
+          
+          for tag in tags:
+              new_tag = f'CMFA-{tag}'
+              
+              # 读取原始时间
+              try:
+                  with open(f'date_{tag}.txt', 'r') as df:
+                      orig_date = df.read().strip()
+              except:
+                  print(f'⚠️ 无法找到 {tag} 的时间文件，跳过')
+                  continue
+              
+              print(f'--------------------------------')
+              print(f'🔧 处理: {new_tag} (目标时间: {orig_date})')
+              
+              # 1. 获取 Release ID (带重试)
+              release_id = None
+              for i in range(5):
+                  try:
+                      cmd = ['gh', 'api', f'repos/{repo_path}/releases/tags/{new_tag}', '--jq', '.id']
+                      result = subprocess.check_output(cmd).decode().strip()
+                      if result:
+                          release_id = result
+                          break
+                  except:
+                      pass
+                  time.sleep(2)
+              
+              if not release_id:
+                  print(f'❌ 无法获取 ID: {new_tag}')
+                  continue
+                  
+              # 2. 构造 API Payload
+              # 决定是否为 latest
+              is_latest = 'true' if tag == king_tag else 'false'
+              
+              # 核心：在一个请求里同时改状态和改时间
+              # 注意：API 参数 make_latest 接受 'true'/'false'/'legacy'
+              payload = {
+                  'draft': False,
+                  'published_at': orig_date,
+                  'make_latest': str(is_latest).lower()
+              }
+              
+              # 3. 发送 PATCH 请求
+              try:
+                  # gh api 接受 json 字段
+                  cmd_patch = [
+                      'gh', 'api', 
+                      '--method', 'PATCH', 
+                      f'repos/{repo_path}/releases/{release_id}',
+                      '-f', f'draft=false',
+                      '-f', f'published_at={orig_date}',
+                      '-f', f'make_latest={str(is_latest).lower()}'
+                  ]
+                  subprocess.check_call(cmd_patch, stdout=subprocess.DEVNULL)
+                  print(f'✅ 原子发布成功！Draft->Public, Time->{orig_date}, Latest->{is_latest}')
+              except Exception as e:
+                  print(f'❌ API 请求失败: {e}')
+                  
+              # 小间隔
+              time.sleep(1)
+          "
+          
+          echo "🏁 完美收官！"
