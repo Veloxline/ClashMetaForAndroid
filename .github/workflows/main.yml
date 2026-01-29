@@ -1,4 +1,4 @@
-name: 2. 纯净搬运 (分段硬间隔版)
+name: 2. 纯净搬运 (动态智能分段版)
 
 on:
   schedule:
@@ -6,138 +6,117 @@ on:
   workflow_dispatch:
 
 jobs:
-  segmented-sync:
+  dynamic-segment-sync:
     runs-on: ubuntu-latest
     steps:
       - name: 初始化
         uses: actions/checkout@v4
 
-      - name: 执行分段搬运
+      - name: 1. 获取并排序所有版本
         env:
           GH_TOKEN: ${{ secrets.MY_PAT }}
           SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
         run: |
-          # 允许报错继续，防止个别版本卡死脚本
-          set +e
-          
           mkdir -p download_temp
           
-          echo "🔍 获取全量标签列表..."
-          gh release list -R $SOURCE_REPO --limit 100 --json tagName -q '.[].tagName' | grep "^v" > all_tags.txt
+          echo "🔍 获取全量列表..."
+          gh release list -R $SOURCE_REPO --limit 100 --json tagName -q '.[].tagName' | grep "^v" > raw.txt
           
-          # ==========================================
-          # 🟢 核心逻辑：分段循环 (从 2.8 到 2.15)
-          # ==========================================
-          for MINOR in {8..15}; do
-            PREFIX="v2.${MINOR}."
-            echo "======================================================="
-            echo "🎬 正在准备分段: ${PREFIX}x (2.${MINOR}.0 - 2.${MINOR}.99)"
-            echo "======================================================="
-            
-            # 1. 筛选当前段的版本 (例如 v2.8.*)
-            grep "^${PREFIX}" all_tags.txt > segment_raw.txt
-            
-            # 如果这一段里没有版本 (比如 v2.15 还没出)，直接跳过
-            if [ ! -s segment_raw.txt ]; then
-               echo "⏭️ 未发现 ${PREFIX}x 系列版本，跳过此段。"
-               continue
-            fi
-            
-            # 2. 段内排序 (Python 确保 v2.8.1 < v2.8.9)
-            python3 -c "
+          echo "🧮 Python 智能排序..."
+          # 这里 Python 会把 v2.9 和 v2.11 区分得清清楚楚
+          python3 -c "
           import sys
-          lines = [l.strip() for l in open('segment_raw.txt') if l.strip()]
+          lines = [l.strip() for l in open('raw.txt') if l.strip()]
           def sort_key(s):
               nums = s.lstrip('v').split('-')[0].split('.')
               return [int(x) for x in nums if x.isdigit()]
           lines.sort(key=sort_key)
           print('\n'.join(lines))
-          " > segment_tags.txt
+          " > tags.txt
+          
+          # 锁定 King (最新版)
+          KING_TAG=$(tail -n 1 tags.txt)
+          echo "KING_TAG=$KING_TAG" >> $GITHUB_ENV
+          echo "👑 目标新王: $KING_TAG"
+
+      - name: 2. 动态分段执行
+        env:
+          GH_TOKEN: ${{ secrets.MY_PAT }}
+          SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
+        run: |
+          set +e # 允许报错继续
+          
+          TOTAL=$(wc -l < tags.txt)
+          CURRENT=0
+          LAST_MINOR="" # 用于记录上一个版本号 (比如 "2.9")
+          
+          while read TAG; do
+            CURRENT=$((CURRENT+1))
+            NEW_TAG="CMFA-$TAG"
             
-            COUNT=$(wc -l < segment_tags.txt)
-            echo "📊 本段共发现 $COUNT 个版本，开始搬运..."
+            # --- 智能分段逻辑 ---
+            # 提取当前的主版本号 (例如 v2.9.1 -> "2.9")
+            CURRENT_MINOR=$(echo $TAG | awk -F. '{print $1"."$2}')
             
-            # 3. 开始搬运当前段
-            while read TAG; do
-              NEW_TAG="CMFA-$TAG"
-              
-              # 查重
-              if gh release view $NEW_TAG > /dev/null 2>&1; then
-                 echo "⏭️ $NEW_TAG 已存在"
-                 continue
-              fi
-              
-              echo "🚀 搬运: $TAG"
-              
-              # 抓取信息
-              gh release view $TAG -R $SOURCE_REPO --json publishedAt,body > meta.json
-              if [ $? -ne 0 ]; then continue; fi
-              
-              # 生成 Note
-              ORIG_DATE=$(jq -r .publishedAt meta.json)
-              NICE_DATE=$(date -d "$ORIG_DATE" +'%Y-%m-%d %H:%M')
-              echo -e "### 📅 原版发布时间: **$NICE_DATE**\n\n---" > notes.md
-              jq -r .body meta.json >> notes.md
-              
-              # 下载
-              rm -rf download_temp/*
-              gh release download $TAG -R $SOURCE_REPO -D download_temp 2>/dev/null
-              
-              # 上传 (全部设为非 Latest，最后再统一加冕)
-              if [ -n "$(ls -A download_temp 2>/dev/null)" ]; then
-                 gh release create "$NEW_TAG" download_temp/* --title "CMFA: $TAG" -F notes.md --latest=false
-              else
-                 gh release create "$NEW_TAG" --title "CMFA: $TAG (无附件)" -F notes.md --latest=false
-              fi
-              
-              # 段内微小间隔 (2秒)
-              sleep 2
-              
-            done < segment_tags.txt
-            
-            echo "✅ 分段 ${PREFIX}x 处理完毕。"
-            
-            # ==========================================
-            # 🟢 物理硬间隔：强制休息 10 分钟 (600秒)
-            # 只有当不是最后一个循环时才等待，避免最后白等
-            # ==========================================
-            if [ "$MINOR" -lt 15 ]; then
-               echo "☕ 触发分段机制：强制休眠 10 分钟..."
-               echo "⏳ 现在的 2.${MINOR}.x 将比未来的 2.$((MINOR+1)).x 早出生 10 分钟。"
-               # 这里的 sleep 600 就是 10 分钟
-               # 为了防止 Action 超时或您不想等太久，您可以把 600 改成 300 (5分钟)，通常也够了
-               # 按照您的要求，这里设为 600
-               sleep 600
+            # 如果版本号变了 (比如从 2.9 变成了 2.10)，且不是第一次运行
+            if [ -n "$LAST_MINOR" ] && [ "$CURRENT_MINOR" != "$LAST_MINOR" ]; then
+                echo "========================================"
+                echo "🛑 检测到版本跨越: $LAST_MINOR -> $CURRENT_MINOR"
+                echo "☕ 强制休息 3 分钟，制造时间物理断层..."
+                echo "========================================"
+                sleep 180 # 3分钟足够了
             fi
             
-          done
+            # 更新记录
+            LAST_MINOR="$CURRENT_MINOR"
+            
+            # --- 搬运逻辑 ---
+            # 查重
+            if gh release view $NEW_TAG > /dev/null 2>&1; then
+               echo "⏭️ $NEW_TAG 已存在"
+               continue
+            fi
+            
+            echo "🚀 [$CURRENT/$TOTAL] 处理: $TAG"
+            
+            # 抓取信息
+            gh release view $TAG -R $SOURCE_REPO --json publishedAt,body > meta.json
+            if [ $? -ne 0 ]; then continue; fi
+            
+            ORIG_DATE=$(jq -r .publishedAt meta.json)
+            echo -e "### 📅 原版发布时间: **$ORIG_DATE**\n\n---" > notes.md
+            jq -r .body meta.json >> notes.md
+            
+            # 下载
+            rm -rf download_temp/*
+            gh release download $TAG -R $SOURCE_REPO -D download_temp 2>/dev/null
+            
+            # 上传 (全部设为 false，最后单独加冕 King)
+            if [ -n "$(ls -A download_temp 2>/dev/null)" ]; then
+               gh release create "$NEW_TAG" download_temp/* --title "CMFA: $TAG" -F notes.md --latest=false
+            else
+               gh release create "$NEW_TAG" --title "CMFA: $TAG (无附件)" -F notes.md --latest=false
+            fi
+            
+            # 小段间隔
+            sleep 2
+            
+          done < tags.txt
           
-          # ==========================================
-          # 🟢 终极加冕：找出真正的老大
-          # ==========================================
+      - name: 3. 终极加冕 (The King)
+        env:
+          GH_TOKEN: ${{ secrets.MY_PAT }}
+          SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
+        run: |
+          NEW_TAG="CMFA-$KING_TAG"
+          
           echo "----------------------------------------"
-          echo "🏆 所有分段任务结束，正在寻找真正的 King..."
+          echo "👑 正在为新王加冕: $NEW_TAG"
+          echo "----------------------------------------"
           
-          # 重新获取所有已搬运的标签进行计算
-          gh release list --limit 100 --json tagName -q '.[].tagName' | grep "^CMFA-v" > final_check.txt
+          # 强制修改为 Latest，并且强制标记为【正式版】(非 Prerelease)
+          # 这很关键，有时候 Prerelease 即使是新的也不会置顶
+          gh release edit "$NEW_TAG" --make-latest --prerelease=false
           
-          LATEST_TAG=$(python3 -c "
-          import sys
-          lines = [l.strip() for l in open('final_check.txt') if l.strip()]
-          def sort_key(s):
-              nums = s.replace('CMFA-v', '').split('-')[0].split('.')
-              return [int(x) for x in nums if x.isdigit()]
-          lines.sort(key=sort_key)
-          if lines: print(lines[-1])
-          ")
-          
-          if [ -n "$LATEST_TAG" ]; then
-             echo "👑 最终确认最新版为: $LATEST_TAG"
-             echo "⚡ 执行加冕仪式..."
-             gh release edit "$LATEST_TAG" --make-latest
-             echo "🎉 完美收官！"
-          else
-             echo "⚠️ 未找到任何版本，加冕失败。"
-          fi
-          
-          rm -rf download_temp *.txt meta.json notes.md
+          echo "🎉 完美收官！请去 Releases 页面查看。"
+          rm -rf download_temp tags.txt raw.txt meta.json notes.md
