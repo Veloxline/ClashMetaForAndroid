@@ -1,4 +1,4 @@
-name: 2. 纯净搬运 (动态智能分段版)
+name: 2. 纯净搬运 (草稿流水线版)
 
 on:
   schedule:
@@ -6,13 +6,13 @@ on:
   workflow_dispatch:
 
 jobs:
-  dynamic-segment-sync:
+  draft-assembly-sync:
     runs-on: ubuntu-latest
     steps:
       - name: 初始化
         uses: actions/checkout@v4
 
-      - name: 1. 获取并排序所有版本
+      - name: 1. 准备清单
         env:
           GH_TOKEN: ${{ secrets.MY_PAT }}
           SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
@@ -22,8 +22,7 @@ jobs:
           echo "🔍 获取全量列表..."
           gh release list -R $SOURCE_REPO --limit 100 --json tagName -q '.[].tagName' | grep "^v" > raw.txt
           
-          echo "🧮 Python 智能排序..."
-          # 这里 Python 会把 v2.9 和 v2.11 区分得清清楚楚
+          echo "🧮 Python 智能排序 (确保从小到大)..."
           python3 -c "
           import sys
           lines = [l.strip() for l in open('raw.txt') if l.strip()]
@@ -37,52 +36,35 @@ jobs:
           # 锁定 King (最新版)
           KING_TAG=$(tail -n 1 tags.txt)
           echo "KING_TAG=$KING_TAG" >> $GITHUB_ENV
-          echo "👑 目标新王: $KING_TAG"
+          echo "👑 锁定的新王: $KING_TAG"
 
-      - name: 2. 动态分段执行
+      - name: 2.【进货阶段】全部上传为草稿 (Draft)
         env:
           GH_TOKEN: ${{ secrets.MY_PAT }}
           SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
         run: |
-          set +e # 允许报错继续
+          set +e # 允许报错继续，保证尽可能多的文件上传成功
           
           TOTAL=$(wc -l < tags.txt)
           CURRENT=0
-          LAST_MINOR="" # 用于记录上一个版本号 (比如 "2.9")
+          
+          echo "📦 开始进货：所有版本将先作为【草稿】上传..."
           
           while read TAG; do
             CURRENT=$((CURRENT+1))
             NEW_TAG="CMFA-$TAG"
             
-            # --- 智能分段逻辑 ---
-            # 提取当前的主版本号 (例如 v2.9.1 -> "2.9")
-            CURRENT_MINOR=$(echo $TAG | awk -F. '{print $1"."$2}')
-            
-            # 如果版本号变了 (比如从 2.9 变成了 2.10)，且不是第一次运行
-            if [ -n "$LAST_MINOR" ] && [ "$CURRENT_MINOR" != "$LAST_MINOR" ]; then
-                echo "========================================"
-                echo "🛑 检测到版本跨越: $LAST_MINOR -> $CURRENT_MINOR"
-                echo "☕ 强制休息 3 分钟，制造时间物理断层..."
-                echo "========================================"
-                sleep 180 # 3分钟足够了
-            fi
-            
-            # 更新记录
-            LAST_MINOR="$CURRENT_MINOR"
-            
-            # --- 搬运逻辑 ---
-            # 查重
+            # 查重 (如果已经是正式版或草稿，都跳过)
             if gh release view $NEW_TAG > /dev/null 2>&1; then
-               echo "⏭️ $NEW_TAG 已存在"
+               echo "⏭️ $NEW_TAG 已存在，跳过。"
                continue
             fi
             
-            echo "🚀 [$CURRENT/$TOTAL] 处理: $TAG"
+            echo "📥 [$CURRENT/$TOTAL] 下载并上传草稿: $TAG"
             
-            # 抓取信息
+            # 准备笔记
             gh release view $TAG -R $SOURCE_REPO --json publishedAt,body > meta.json
             if [ $? -ne 0 ]; then continue; fi
-            
             ORIG_DATE=$(jq -r .publishedAt meta.json)
             echo -e "### 📅 原版发布时间: **$ORIG_DATE**\n\n---" > notes.md
             jq -r .body meta.json >> notes.md
@@ -91,32 +73,60 @@ jobs:
             rm -rf download_temp/*
             gh release download $TAG -R $SOURCE_REPO -D download_temp 2>/dev/null
             
-            # 上传 (全部设为 false，最后单独加冕 King)
+            # 🟢 核心：上传为 Draft (公众不可见，无时间戳负担)
             if [ -n "$(ls -A download_temp 2>/dev/null)" ]; then
-               gh release create "$NEW_TAG" download_temp/* --title "CMFA: $TAG" -F notes.md --latest=false
+               gh release create "$NEW_TAG" download_temp/* --title "CMFA: $TAG" -F notes.md --draft
             else
-               gh release create "$NEW_TAG" --title "CMFA: $TAG (无附件)" -F notes.md --latest=false
+               gh release create "$NEW_TAG" --title "CMFA: $TAG (无附件)" -F notes.md --draft
             fi
             
-            # 小段间隔
-            sleep 2
-            
           done < tags.txt
-          
-      - name: 3. 终极加冕 (The King)
+          echo "✅ 进货完成！所有版本现已静静躺在 Draft 列表中。"
+
+      - name: 3.【上架阶段】按顺序发布 (Publish)
         env:
           GH_TOKEN: ${{ secrets.MY_PAT }}
           SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
         run: |
-          NEW_TAG="CMFA-$KING_TAG"
+          set +e
           
-          echo "----------------------------------------"
-          echo "👑 正在为新王加冕: $NEW_TAG"
-          echo "----------------------------------------"
+          echo "🚀 开始上架：按严格顺序将草稿转为正式版..."
           
-          # 强制修改为 Latest，并且强制标记为【正式版】(非 Prerelease)
-          # 这很关键，有时候 Prerelease 即使是新的也不会置顶
-          gh release edit "$NEW_TAG" --make-latest --prerelease=false
+          while read TAG; do
+            NEW_TAG="CMFA-$TAG"
+            
+            echo "----------------------------------------"
+            echo "📢 正在发布: $NEW_TAG"
+            
+            # 判断是否为 King
+            EXTRA_FLAGS=""
+            if [ "$TAG" == "$KING_TAG" ]; then
+               # 如果是 King，赋予 Latest 皇冠
+               EXTRA_FLAGS="--make-latest"
+               echo "👑 它是新王！将标记为 Latest。"
+            else
+               # 如果是普通版本，显式标记为非 Latest
+               EXTRA_FLAGS="--latest=false"
+            fi
+            
+            # 🟢 核心：将 Draft 转为 Public
+            # 这一步瞬间完成，正是这一瞬间决定了 GitHub 的时间排序
+            gh release edit "$NEW_TAG" --draft=false $EXTRA_FLAGS
+            
+            if [ $? -eq 0 ]; then
+                echo "✅ 发布成功"
+            else
+                echo "⚠️ 发布失败 (可能是草稿不存在)，尝试直接创建..."
+                # 补救措施：如果草稿没找到，尝试直接创建一个空的 Release 占位
+                gh release create "$NEW_TAG" --title "CMFA: $TAG (补救)" --notes "原版发布时间见标题" $EXTRA_FLAGS
+            fi
+            
+            # 🟢 物理间隔：确保时间戳不重叠
+            # 2秒足够了，因为 API 响应本身就有延迟
+            echo "⏳ 间隔 3 秒..."
+            sleep 3
+            
+          done < tags.txt
           
-          echo "🎉 完美收官！请去 Releases 页面查看。"
+          echo "🏁 完美收官！请查看 Releases 页面。"
           rm -rf download_temp tags.txt raw.txt meta.json notes.md
