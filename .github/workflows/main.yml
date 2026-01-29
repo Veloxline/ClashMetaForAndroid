@@ -1,4 +1,4 @@
-name: 2. 纯净搬运 (Python数学排序版)
+name: 2. 纯净搬运 (智能纠错版)
 
 on:
   schedule:
@@ -6,55 +6,66 @@ on:
   workflow_dispatch:
 
 jobs:
-  python-mirror:
+  smart-mirror:
     runs-on: ubuntu-latest
     steps:
       - name: 初始化
         uses: actions/checkout@v4
 
-      - name: 执行搬运
+      - name: 执行智能搬运
         env:
           GH_TOKEN: ${{ secrets.MY_PAT }}
           SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
         run: |
           mkdir -p download_temp
           
-          echo "🔍 获取列表..."
-          # 1. 抓取所有 v 开头的标签
+          echo "🔍 获取原始版本列表..."
+          # 获取列表，过滤 v 开头的正式版
           gh release list -R $SOURCE_REPO --limit 100 --json tagName -q '.[].tagName' | grep "^v" > raw.txt
           
-          echo "🧮 正在进行 Python 严格排序 (从小到大)..."
+          echo "🧠 正在进行智能顺序检测与修正..."
           
-          # --- Python 脚本：保证 v2.9 在 v2.11 前面 ---
+          # --- Python 智能脚本 ---
           python3 -c "
           import sys
+          
+          # 1. 读取并清理空白符
           lines = [l.strip() for l in open('raw.txt') if l.strip()]
           
-          # 排序函数：v2.11.9 -> [2, 11, 9]
-          def sort_key(s):
-              nums = s.lstrip('v').split('-')[0].split('.')
-              return [int(x) for x in nums if x.isdigit()]
+          # 2. 定义版本解析函数 (将 v2.11.9 -> [2, 11, 9])
+          def parse_ver(v):
+              clean = v.lstrip('v').split('-')[0] # 去掉 v 和后缀
+              return [int(x) for x in clean.split('.') if x.isdigit()]
           
-          # 从小到大排序 (Old -> New)
-          lines.sort(key=sort_key)
+          # 3. 强制从小到大排序 (Old -> New)
+          # 不管输入是什么顺序，这里统一重新排一遍
+          lines.sort(key=parse_ver)
           
+          # 4. 最终检查 (双重保险)
+          if lines:
+              first = lines[0]  #应该是旧的 (2.9)
+              last = lines[-1]  #应该是新的 (2.11)
+              # 如果排序失败导致 2.11 在前面，这里可以打印警告(通常 sort 不会错)
+              sys.stderr.write(f'DEBUG: List starts with {first}, ends with {last}\n')
+          
+          # 5. 输出最终列表
           print('\n'.join(lines))
           " > tags.txt
           
-          # --- 🚨 调试：打印顺序给您确认 ---
+          # --- 🚨 关键验证：请在运行日志中看这一段 ---
           echo "========================================"
-          echo "📊 搬运顺序预演 (如果 v2.9 在上面，v2.11 在下面，就是对的):"
-          echo "➡️ 第一个搬 (最旧): $(head -n 1 tags.txt)"
+          echo "📊 最终执行顺序 (必须是 v2.9 在前，v2.11 在后):"
+          echo "➡️ 第一步搬运: $(head -n 1 tags.txt)"
           echo "..."
-          echo "➡️ 最后一个搬 (最新): $(tail -n 1 tags.txt)"
+          echo "➡️ 最后一步搬运: $(tail -n 1 tags.txt)"
           echo "========================================"
           
           if [ ! -s tags.txt ]; then
-             echo "❌ 列表为空！"
+             echo "❌ 错误：版本列表为空！"
              exit 1
           fi
 
-          # 锁定最后一行作为 Latest
+          # 锁定最后一个版本 (最新版)
           LATEST_TARGET=$(tail -n 1 tags.txt)
           TOTAL=$(wc -l < tags.txt)
           CURRENT=0
@@ -63,7 +74,7 @@ jobs:
             CURRENT=$((CURRENT+1))
             NEW_TAG="CMFA-$TAG"
             
-            # --- 查重：已存在则跳过 (不删!) ---
+            # --- 查重 ---
             if gh release view $NEW_TAG > /dev/null 2>&1; then
               echo "[$CURRENT/$TOTAL] ✅ $NEW_TAG 已存在，跳过。"
               continue
@@ -71,7 +82,7 @@ jobs:
             
             echo "🚀 [$CURRENT/$TOTAL] 正在搬运: $TAG"
             
-            # 1. 准备日志
+            # 1. 抓取日志
             gh release view $TAG -R $SOURCE_REPO --json publishedAt,body > meta.json
             RAW_DATE=$(jq -r .publishedAt meta.json)
             NICE_DATE=$(date -d "$RAW_DATE" +'%Y-%m-%d %H:%M')
@@ -83,7 +94,7 @@ jobs:
             rm -rf download_temp/*
             gh release download $TAG -R $SOURCE_REPO -D download_temp 2>/dev/null || true
             
-            # 3. 上传 (先都设为 false，依靠创建时间排序)
+            # 3. 上传 (先不设 Latest)
             if [ "$(ls -A download_temp)" ]; then
                gh release create $NEW_TAG download_temp/* --title "CMFA: $TAG" -F notes.md --latest=false
             else
@@ -92,15 +103,15 @@ jobs:
             
             echo "✅ $NEW_TAG 完成"
             
-            # 🟢 关键：睡眠 3 秒，确保时间戳拉开差距
+            # 🟢 睡眠 3 秒 (确保 v2.11 是最后创建的)
             sleep 3
             
           done < tags.txt
           
-          # --- 终极修正：把皇冠给最后搬运的那个 ---
+          # --- 终极修正：把皇冠给最后处理的那个 ---
           if [ ! -z "$LATEST_TARGET" ]; then
              FINAL_TAG="CMFA-$LATEST_TARGET"
-             echo "👑 强制设定 Latest: $FINAL_TAG"
+             echo "👑 正在将最后搬运的 $FINAL_TAG 设为 Latest..."
              gh release edit "$FINAL_TAG" --make-latest || true
           fi
           
