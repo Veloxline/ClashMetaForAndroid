@@ -1,4 +1,4 @@
-name: 2. 纯净搬运 (智能死磕版)
+name: 2. 纯净搬运 (精准加冕版)
 
 on:
   schedule:
@@ -6,10 +6,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  smart-retry-sync:
+  crown-sync:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write # 必须有权限修改 Release
     steps:
       - name: 初始化
         uses: actions/checkout@v4
@@ -19,21 +17,43 @@ jobs:
           GH_TOKEN: ${{ secrets.MY_PAT }}
           SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
         run: |
-          # 1. 锁定仓库信息
-          MY_REPO=$(gh repo view --json owner,name -q ".owner.login + \"/\" + .name")
-          echo "📍 目标仓库: $MY_REPO"
-          
           mkdir -p download_temp
           
           echo "🔍 获取原始列表..."
-          gh release list -R $SOURCE_REPO --limit 100 --json tagName -q '.[].tagName' | grep "^v" > tags.txt
+          gh release list -R $SOURCE_REPO --limit 100 --json tagName -q '.[].tagName' | grep "^v" > raw.txt
           
+          echo "🧮 正在进行 Python 严格排序 (从小到大)..."
+          
+          # --- Python 排序：确保 v2.9 在前，v2.11 在后 ---
+          python3 -c "
+          import sys
+          lines = [l.strip() for l in open('raw.txt') if l.strip()]
+          def sort_key(s):
+              nums = s.lstrip('v').split('-')[0].split('.')
+              return [int(x) for x in nums if x.isdigit()]
+          lines.sort(key=sort_key)
+          print('\n'.join(lines))
+          " > tags.txt
+          
+          # 验证排序
+          echo "========================================"
+          echo "📊 搬运计划 (最后一行必须是 v2.11.x):"
+          echo "➡️ 最后一行: $(tail -n 1 tags.txt)"
+          echo "========================================"
+          
+          if [ ! -s tags.txt ]; then
+             echo "❌ 列表为空！"
+             exit 1
+          fi
+
           TOTAL=$(wc -l < tags.txt)
           CURRENT=0
+          LAST_TAG=""  # 用于记住最后一个版本
           
           while read TAG; do
             CURRENT=$((CURRENT+1))
             NEW_TAG="CMFA-$TAG"
+            LAST_TAG="$NEW_TAG"  # 实时更新，循环结束时它就是最新的那个
             
             # --- 查重 ---
             if gh release view $NEW_TAG > /dev/null 2>&1; then
@@ -41,10 +61,9 @@ jobs:
               continue
             fi
             
-            echo "----------------------------------------"
             echo "🚀 [$CURRENT/$TOTAL] 正在搬运: $TAG"
             
-            # 1. 抓取原版时间
+            # 1. 抓取日志
             gh release view $TAG -R $SOURCE_REPO --json publishedAt,body > meta.json
             ORIG_DATE=$(jq -r .publishedAt meta.json)
             NICE_DATE=$(date -d "$ORIG_DATE" +'%Y-%m-%d %H:%M')
@@ -56,63 +75,33 @@ jobs:
             rm -rf download_temp/*
             gh release download $TAG -R $SOURCE_REPO -D download_temp 2>/dev/null || true
             
-            # 3. 创建发布
-            echo "📤 上传发布..."
+            # 3. 上传 (统一不设 Latest)
             if [ "$(ls -A download_temp)" ]; then
                gh release create $NEW_TAG download_temp/* --title "CMFA: $TAG" -F notes.md --latest=false
             else
                gh release create $NEW_TAG --title "CMFA: $TAG (无附件)" -F notes.md --latest=false
             fi
             
-            # 🟢 4. 智能死磕获取 ID (核心修改)
-            echo "🔍 正在查询 ID (启动重试机制)..."
-            RELEASE_ID=""
+            echo "✅ $NEW_TAG 完成"
             
-            # 循环 20 次，每次 5 秒，总共给 GitHub 100 秒的反应时间
-            for i in {1..20}; do
-              # 尝试获取 ID
-              RELEASE_ID=$(gh release view "$NEW_TAG" --json databaseId -q .databaseId 2>/dev/null || true)
-              
-              if [ -n "$RELEASE_ID" ]; then
-                echo "🎉 成功获取 ID: $RELEASE_ID (耗时: $((i*5))秒内)"
-                break
-              fi
-              
-              echo "⏳ [$i/20] 暂未查到 ID，GitHub 数据尚未同步，等待 5 秒..."
-              sleep 5
-            done
-            
-            # 如果死磕了 100 秒还是空的，那就真的没办法了
-            if [ -z "$RELEASE_ID" ]; then
-              echo "❌ 严重错误：重试 20 次仍无法获取 ID，$NEW_TAG 时间修正失败！"
-            else
-              # 5. 修改时间
-              echo "🔧 修正时间戳 -> $ORIG_DATE"
-              gh api --method PATCH "/repos/$MY_REPO/releases/$RELEASE_ID" -f published_at="$ORIG_DATE"
-              echo "✅ 完成！"
-            fi
+            # 睡眠 5 秒，拉开时间差距
+            sleep 5
             
           done < tags.txt
           
-          # --- 6. 自动加冕 ---
-          echo "👑 正在计算最新版本..."
-          # 获取所有 tags，用 Python 算出最大的版本号
-          gh release list --limit 100 --json tagName -q '.[].tagName' | grep "^CMFA-v" > all_tags.txt
-          
-          LATEST_TAG=$(python3 -c "
-          import sys
-          lines = [l.strip() for l in open('all_tags.txt') if l.strip()]
-          def sort_key(s):
-              nums = s.replace('CMFA-v', '').split('-')[0].split('.')
-              return [int(x) for x in nums if x.isdigit()]
-          lines.sort(key=sort_key)
-          if lines: print(lines[-1])
-          ")
-          
-          if [ ! -z "$LATEST_TAG" ]; then
-             echo "🎯 锁定新王: $LATEST_TAG"
-             gh release edit "$LATEST_TAG" --make-latest
+          # --- 🟢 终极修正：不再问 GitHub，直接加冕刚才处理的最后一个 ---
+          echo "----------------------------------------"
+          if [ ! -z "$LAST_TAG" ]; then
+             echo "👑 脚本记忆确认，真正的最新版是: $LAST_TAG"
+             echo "⚡ 正在强制加冕..."
+             
+             # 强制标记为 Latest
+             gh release edit "$LAST_TAG" --make-latest
+             
+             echo "🎉 加冕成功！$LAST_TAG 现在是 Latest Release。"
+          else
+             echo "⚠️ 异常：未能记录到任何版本。"
           fi
           
-          rm -rf download_temp tags.txt meta.json notes.md all_tags.txt
-          echo "🏁 所有任务结束！"
+          rm -rf download_temp tags.txt raw.txt meta.json notes.md
+          echo "🏁 任务结束！"
