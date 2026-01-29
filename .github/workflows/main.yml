@@ -1,42 +1,59 @@
-name: 2. 纯净搬运 (只建不删 | 完美排序)
+name: 2. 纯净搬运 (Python数学排序版)
 
 on:
   schedule:
-    - cron: '0 */12 * * *'  # 每天跑两次
-  workflow_dispatch:        # 手动触发
+    - cron: '0 */12 * * *'
+  workflow_dispatch:
 
 jobs:
-  pure-sync:
+  python-sort-sync:
     runs-on: ubuntu-latest
     steps:
       - name: 初始化
         uses: actions/checkout@v4
 
-      - name: 执行排序搬运
+      - name: 执行搬运
         env:
           GH_TOKEN: ${{ secrets.MY_PAT }}
           SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
         run: |
           mkdir -p download_temp
           
-          echo "🔍 获取列表并进行数学排序..."
+          echo "🔍 获取列表..."
+          # 先获取所有 v 开头的版本，暂存到文件中
+          gh release list -R $SOURCE_REPO --limit 100 --json tagName -q '.[].tagName' | grep "^v" > raw_tags.txt
           
-          # 1. grep "^v": 只保留 v 开头的正式版 (过滤掉 Prerelease)
-          # 2. sort -V: 关键！按版本号从小到大排序 (v2.9 -> v2.10 -> v2.11)
-          #    这样脚本会先创建旧版，最后创建新版。
-          gh release list -R $SOURCE_REPO --limit 100 --json tagName -q '.[].tagName' \
-            | grep "^v" \
-            | sort -V > tags.txt
+          echo "🧮 正在使用 Python 进行严格数学排序..."
           
-          # 检查列表
+          # --- 核心必杀技：Python 排序 ---
+          # 这段 Python 代码会把 "v2.9" 和 "v2.11" 真正按数字大小排列
+          # 结果保证是：v2.9 -> v2.10 -> v2.11
+          python3 -c "
+          import sys
+          # 读取所有行
+          lines = [l.strip() for l in open('raw_tags.txt') if l.strip()]
+          # 排序函数：去掉 'v'，按 '.' 分割，转成数字列表进行比较
+          # 例如 v2.11.22 -> [2, 11, 22]
+          lines.sort(key=lambda s: [int(u) for u in s.lstrip('v').split('.') if u.isdigit()])
+          # 打印结果
+          print('\n'.join(lines))
+          " > tags.txt
+          
+          # 检查排序结果（调试用）
+          echo "📊 排序预览 (头部-旧):"
+          head -n 3 tags.txt
+          echo "..."
+          echo "📊 排序预览 (尾部-新):"
+          tail -n 3 tags.txt
+          
           if [ ! -s tags.txt ]; then
-            echo "❌ 未获取到版本列表，请检查网络或 Token。"
-            exit 1
+             echo "❌ 列表为空，终止。"
+             exit 1
           fi
-          
-          # 锁定列表中最后一个版本 (也就是版本号最大的)
+
+          # 锁定列表中最后一个版本 (Python 排完序后，最后一个一定是最大的)
           LATEST_TARGET=$(tail -n 1 tags.txt)
-          echo "🎯 本次锁定的最新版本是: $LATEST_TARGET"
+          echo "🎯 锁定真·最新版本: $LATEST_TARGET"
           
           TOTAL=$(wc -l < tags.txt)
           CURRENT=0
@@ -45,7 +62,7 @@ jobs:
             CURRENT=$((CURRENT+1))
             NEW_TAG="CMFA-$TAG"
             
-            # --- 查重 (遇到已存在的直接跳过，不碰它) ---
+            # --- 查重 ---
             if gh release view $NEW_TAG > /dev/null 2>&1; then
               echo "[$CURRENT/$TOTAL] ✅ $NEW_TAG 已存在，跳过。"
               continue
@@ -54,7 +71,7 @@ jobs:
             echo "----------------------------------------"
             echo "🚀 [$CURRENT/$TOTAL] 正在搬运: $TAG"
             
-            # 1. 抓取时间 (仅做展示)
+            # 1. 抓取时间
             RAW_DATE=$(gh release view $TAG -R $SOURCE_REPO --json publishedAt -q .publishedAt 2>/dev/null) || true
             if [ -n "$RAW_DATE" ]; then
                 NICE_DATE=$(date -d "$RAW_DATE" +'%Y-%m-%d %H:%M')
@@ -71,7 +88,7 @@ jobs:
             rm -rf download_temp/*
             gh release download $TAG -R $SOURCE_REPO -D download_temp 2>/dev/null || true
             
-            # 4. 上传 (不指定 latest，依靠时间戳排序)
+            # 4. 上传 (先不标记 Latest)
             if [ "$(ls -A download_temp)" ]; then
                gh release create $NEW_TAG download_temp/* --title "CMFA: $TAG" -F notes.md --latest=false
             else
@@ -80,18 +97,17 @@ jobs:
             
             echo "✅ $NEW_TAG 完成"
             
-            # 🟢 关键：强制睡眠 3 秒
-            # 确保下一个版本的创建时间比这个晚
+            # 🟢 强制睡眠 3 秒 (确保 v2.11 的创建时间确实比 v2.9 晚)
             sleep 3
             
           done < tags.txt
           
-          # --- 终极修正：给最新版加冕 ---
+          # --- 终极修正：把皇冠戴在真正的王者头上 ---
           if [ ! -z "$LATEST_TARGET" ]; then
             FINAL_TAG="CMFA-$LATEST_TARGET"
-            echo "👑 正在将 $FINAL_TAG 标记为 Latest..."
-            gh release edit "$FINAL_TAG" --make-latest || echo "⚠️ 标记失败，可能是该版本未被创建"
+            echo "👑 正在强制将 $FINAL_TAG 设为 Latest..."
+            gh release edit "$FINAL_TAG" --make-latest || echo "⚠️ 标记失败"
           fi
           
-          rm -rf download_temp tags.txt logs.txt notes.md
-          echo "🏁 所有任务完成！"
+          rm -rf download_temp tags.txt raw_tags.txt logs.txt notes.md
+          echo "🏁 完美收官！"
