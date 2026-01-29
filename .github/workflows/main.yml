@@ -1,4 +1,4 @@
-name: 2. 纯净搬运 (强制逆序版)
+name: 2. 纯净搬运 (真实时间复刻版)
 
 on:
   schedule:
@@ -6,58 +6,52 @@ on:
   workflow_dispatch:
 
 jobs:
-  force-flip-sync:
+  real-time-sync:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # 必须有权限修改时间
     steps:
       - name: 初始化
         uses: actions/checkout@v4
 
-      - name: 1. 获取并锁定顺序
+      - name: 1. 获取列表与仓库信息
         env:
           GH_TOKEN: ${{ secrets.MY_PAT }}
           SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
         run: |
           mkdir -p download_temp
           
+          # 1. 动态获取当前仓库路径 (用于 API 调用)
+          # 格式如: Veloxline/ClashMetaForAndroid
+          MY_REPO=$(gh repo view --json owner,name -q ".owner.login + \"/\" + .name")
+          echo "REPO_PATH=$MY_REPO" >> $GITHUB_ENV
+          echo "📍 当前仓库: $MY_REPO"
+          
           echo "🔍 获取原始列表..."
           gh release list -R $SOURCE_REPO --limit 100 --json tagName -q '.[].tagName' | grep "^v" > raw.txt
           
-          # 简单的字符排序 (默认 v2.11 会排在 v2.9 前面，这是我们不想要的)
-          # 但我们马上就会修正它
-          sort raw.txt > tags.txt
+          # 2. Python 排序 (确保处理顺序是从旧到新)
+          python3 -c "
+          import sys
+          lines = [l.strip() for l in open('raw.txt') if l.strip()]
+          def sort_key(s):
+              nums = s.lstrip('v').split('-')[0].split('.')
+              return [int(x) for x in nums if x.isdigit()]
+          lines.sort(key=sort_key)
+          print('\n'.join(lines))
+          " > tags.txt
           
-          # --- 🟢 核心保险丝：检查顺序并强制翻转 ---
-          FIRST_LINE=$(head -n 1 tags.txt)
-          echo "🧐 检测到列表第一行是: $FIRST_LINE"
-          
-          # 如果第一行包含 "v2.11" (新版)，说明列表是 [新 -> 旧]
-          # 我们需要 [旧 -> 新]，所以必须翻转！
-          if [[ "$FIRST_LINE" == *"v2.11"* ]]; then
-             echo "⚠️ 发现顺序反了 (新版在前)！正在执行强制翻转..."
-             # tac 命令用于将文件倒序 (从最后一行读到第一行)
-             tac tags.txt > fixed_tags.txt
-             mv fixed_tags.txt tags.txt
-             echo "✅ 翻转完成。"
-          else
-             echo "✅ 顺序看起来是正确的 (旧版在前)。"
-          fi
-          
-          echo "========================================"
-          echo "📊 最终执行计划 (必须是 v2.9 在前，v2.11 在最后):"
-          echo "➡️ 第一步处理: $(head -n 1 tags.txt)"
-          echo "..."
-          echo "➡️ 最后一步处理: $(tail -n 1 tags.txt)"
-          echo "========================================"
-          
-          # 锁定最后一行作为 King
+          # 锁定 King (最新版)
           KING_TAG=$(tail -n 1 tags.txt)
           echo "KING_TAG=$KING_TAG" >> $GITHUB_ENV
+          echo "👑 目标新王: $KING_TAG"
 
-      - name: 2. 执行有序搬运
+      - name: 2. 搬运并恢复时间 (核心步骤)
         env:
           GH_TOKEN: ${{ secrets.MY_PAT }}
           SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
         run: |
+          # 允许脚本遇到错误继续跑 (确保所有版本都被处理)
           set +e
           
           TOTAL=$(wc -l < tags.txt)
@@ -67,43 +61,70 @@ jobs:
             CURRENT=$((CURRENT+1))
             NEW_TAG="CMFA-$TAG"
             
+            echo "----------------------------------------"
             echo "🚀 [$CURRENT/$TOTAL] 处理: $TAG"
             
-            # 1. 抓取信息
+            # 1. 抓取原版时间 (ORIG_DATE)
             gh release view $TAG -R $SOURCE_REPO --json publishedAt,body > meta.json
-            if [ $? -ne 0 ]; then continue; fi
+            if [ $? -ne 0 ]; then echo "⚠️ 跳过无效版本"; continue; fi
             
             ORIG_DATE=$(jq -r .publishedAt meta.json)
-            NICE_DATE=$(date -d "$ORIG_DATE" +'%Y-%m-%d %H:%M')
-            echo -e "### 📅 原版发布时间: **$NICE_DATE**\n\n---" > notes.md
-            jq -r .body meta.json >> notes.md
+            echo "📅 目标时间: $ORIG_DATE"
             
-            # 2. 判断是否最新
-            # 只有最后一步处理 King 时，才给 --make-latest
+            # 准备日志
+            jq -r .body meta.json > notes.md
+            
+            # 2. 决定是否为 Latest
             LATEST_FLAG="--latest=false"
             if [ "$TAG" == "$KING_TAG" ]; then
-               LATEST_FLAG="--make-latest"
-               echo "👑 这是最后一步，加冕最新版！"
+               LATEST_FLAG="--latest" # 正确的参数是 --latest
+               echo "👑 标记为 Latest"
             fi
             
-            # 3. 下载
+            # 3. 下载与创建
             rm -rf download_temp/*
             gh release download $TAG -R $SOURCE_REPO -D download_temp 2>/dev/null
             
-            # 4. 上传
-            # 修复了文件检测逻辑，确保不报错
+            # 创建 Release (此时时间是“现在”)
             if [ -n "$(ls -A download_temp 2>/dev/null)" ]; then
                gh release create "$NEW_TAG" download_temp/* --title "CMFA: $TAG" -F notes.md $LATEST_FLAG
             else
                gh release create "$NEW_TAG" --title "CMFA: $TAG (无附件)" -F notes.md $LATEST_FLAG
             fi
             
-            # 🟢 5. 强制睡眠 3 秒
-            # 确保 v2.11 的创建时间比 v2.9 晚 3 秒以上
-            # 这是 GitHub 正确排序的物理基础
-            sleep 3
+            # 🟢 4. 关键：强制等待 5 秒，让 GitHub 数据库入库
+            # 如果不等，下面的 API 查找会报 404
+            echo "⏳ 等待数据同步..."
+            sleep 5
+            
+            # 🟢 5. 查找 Release ID (带重试机制)
+            RELEASE_ID=""
+            for i in {1..5}; do
+               # 使用 API 获取 ID
+               RELEASE_ID=$(gh api "repos/$REPO_PATH/releases/tags/$NEW_TAG" --jq .id 2>/dev/null)
+               
+               if [ -n "$RELEASE_ID" ]; then
+                  echo "🔍 获取到 ID: $RELEASE_ID"
+                  break
+               fi
+               echo "⚠️ 未找到 ID，重试 ($i/5)..."
+               sleep 2
+            done
+            
+            # 🟢 6. 修改时间 (Time Travel)
+            if [ -n "$RELEASE_ID" ]; then
+               echo "🔧 正在将时间穿越回 $ORIG_DATE ..."
+               gh api --method PATCH "repos/$REPO_PATH/releases/$RELEASE_ID" -f published_at="$ORIG_DATE"
+               if [ $? -eq 0 ]; then
+                  echo "✅ 时间修正成功！"
+               else
+                  echo "❌ 时间修正失败 (API错误)"
+               fi
+            else
+               echo "❌ 严重错误: 无法获取 ID，跳过时间修正。"
+            fi
             
           done < tags.txt
           
           rm -rf download_temp tags.txt raw.txt meta.json notes.md
-          echo "🏁 任务结束！"
+          echo "🏁 任务结束！请检查 Releases 页面。"
