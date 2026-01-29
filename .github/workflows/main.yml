@@ -1,4 +1,4 @@
-name: 2. 纯净搬运 (全量检索修复版)
+name: 2. 纯净搬运 (2.10+ 版本)
 
 on:
   schedule:
@@ -6,180 +6,127 @@ on:
   workflow_dispatch:
 
 jobs:
-  list-match-sync:
+  filter-sync:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # 必须有权限修改 Release
+      contents: write
     steps:
       - name: 初始化
         uses: actions/checkout@v4
 
-      - name: 1. 准备清单
+      - name: 1. 获取并筛选列表 (2.10+)
         env:
           GH_TOKEN: ${{ secrets.MY_PAT }}
           SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
         run: |
           mkdir -p download_temp
           
-          # 获取当前仓库 owner/repo
-          MY_REPO=$(gh repo view --json owner,name -q ".owner.login + \"/\" + .name")
-          echo "REPO_PATH=$MY_REPO" >> $GITHUB_ENV
-          echo "📍 当前仓库: $MY_REPO"
-          
           echo "🔍 获取全量列表..."
           gh release list -R $SOURCE_REPO --limit 100 --json tagName -q '.[].tagName' | grep "^v" > raw.txt
           
-          echo "🧮 Python 排序..."
+          echo "✂️ 正在筛选 >= v2.10.0 的版本..."
+          
+          # --- Python 筛选脚本 ---
           python3 -c "
           import sys
+          
+          # 读取
           lines = [l.strip() for l in open('raw.txt') if l.strip()]
+          
+          filtered = []
+          for tag in lines:
+              # 解析版本号: v2.11.22 -> [2, 11, 22]
+              # 移除 'v' 和可能的后缀
+              clean_v = tag.lstrip('v').split('-')[0]
+              try:
+                  parts = [int(x) for x in clean_v.split('.') if x.isdigit()]
+                  
+                  # 核心过滤逻辑: 主版本>2 或 (主版本=2 且 次版本>=10)
+                  if len(parts) >= 2:
+                      major, minor = parts[0], parts[1]
+                      if major > 2 or (major == 2 and minor >= 10):
+                          filtered.append(tag)
+              except:
+                  continue
+          
+          # 排序: 从旧到新 (v2.10.0 -> v2.11.22)
           def sort_key(s):
               nums = s.lstrip('v').split('-')[0].split('.')
               return [int(x) for x in nums if x.isdigit()]
-          lines.sort(key=sort_key)
-          print('\n'.join(lines))
+          
+          filtered.sort(key=sort_key)
+          
+          # 输出
+          print('\n'.join(filtered))
           " > tags.txt
           
-          # 锁定 King
+          # 锁定最新的 King
           KING_TAG=$(tail -n 1 tags.txt)
           echo "KING_TAG=$KING_TAG" >> $GITHUB_ENV
-          echo "👑 目标新王: $KING_TAG"
+          
+          COUNT=$(wc -l < tags.txt)
+          echo "========================================"
+          echo "📊 筛选结果: 共 $COUNT 个版本"
+          echo "➡️ 起点: $(head -n 1 tags.txt)"
+          echo "➡️ 终点 (King): $KING_TAG"
+          echo "========================================"
 
-      - name: 2.【进货】上传所有草稿
+      - name: 2. 执行搬运
         env:
           GH_TOKEN: ${{ secrets.MY_PAT }}
           SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
         run: |
           set +e
+          
           TOTAL=$(wc -l < tags.txt)
           CURRENT=0
           
-          echo "📦 开始上传草稿..."
           while read TAG; do
             CURRENT=$((CURRENT+1))
             NEW_TAG="CMFA-$TAG"
             
             # 查重
             if gh release view $NEW_TAG > /dev/null 2>&1; then
-               echo "⏭️ $NEW_TAG 已存在"
+               echo "⏭️ $NEW_TAG 已存在，跳过"
                continue
             fi
             
-            echo "📥 [$CURRENT/$TOTAL] 上传草稿: $TAG"
+            echo "🚀 [$CURRENT/$TOTAL] 处理: $TAG"
             
-            # 抓取元数据
+            # 抓取日志
             gh release view $TAG -R $SOURCE_REPO --json publishedAt,body > meta.json
             if [ $? -ne 0 ]; then continue; fi
             
-            # 保存原始时间到文件
+            # 生成 Note (保留原版时间文字，但不以此为排序依据)
             ORIG_DATE=$(jq -r .publishedAt meta.json)
-            echo "$ORIG_DATE" > "date_$TAG.txt"
-            
-            jq -r .body meta.json > notes.md
+            echo -e "### 📅 原版发布时间: **$ORIG_DATE**\n\n---" > notes.md
+            jq -r .body meta.json >> notes.md
             
             # 下载
             rm -rf download_temp/*
             gh release download $TAG -R $SOURCE_REPO -D download_temp 2>/dev/null
             
-            # 上传为 Draft (注意：此时没有 Tag，GitHub 会分配一个 untagged-xxxx)
-            if [ -n "$(ls -A download_temp 2>/dev/null)" ]; then
-               gh release create "$NEW_TAG" download_temp/* --title "CMFA: $TAG" -F notes.md --draft
+            # 决定 Latest 状态
+            # 如果是 King -> Latest=true
+            # 其他 -> Latest=false
+            if [ "$TAG" == "$KING_TAG" ]; then
+               LATEST_FLAG="--latest"
+               echo "👑 它是最新版！"
             else
-               gh release create "$NEW_TAG" --title "CMFA: $TAG (无附件)" -F notes.md --draft
+               LATEST_FLAG="--latest=false"
             fi
+            
+            # 上传 (直接创建，依赖脚本的运行顺序 2.10 -> 2.11)
+            # GitHub 默认把最后创建的视为最新，配合 --latest 标记双重保险
+            if [ -n "$(ls -A download_temp 2>/dev/null)" ]; then
+               gh release create "$NEW_TAG" download_temp/* --title "CMFA: $TAG" -F notes.md $LATEST_FLAG
+            else
+               gh release create "$NEW_TAG" --title "CMFA: $TAG (无附件)" -F notes.md $LATEST_FLAG
+            fi
+            
+            # 休息 3 秒，确保创建时间有先后
+            sleep 3
             
           done < tags.txt
           
-          echo "✅ 草稿上传完毕。休息 5 秒..."
-          sleep 5
-
-      - name: 3.【发布】全量检索并修正
-        env:
-          GH_TOKEN: ${{ secrets.MY_PAT }}
-        run: |
-          # 使用 Python 处理复杂逻辑
-          python3 -c "
-          import os
-          import subprocess
-          import time
-          import json
-          
-          repo_path = os.environ['REPO_PATH']
-          king_tag = os.environ['KING_TAG']
-          
-          # 读取目标 tags
-          with open('tags.txt', 'r') as f:
-              target_tags = [line.strip() for line in f if line.strip()]
-          
-          print(f'🚀 开始检索修复流程...')
-          
-          # 🟢 1. 获取当前仓库所有 Releases (包括 Drafts)
-          # 这是修复 404 错误的关键！我们要一次性拉取所有 ID
-          print(f'🔍 拉取 {repo_path} 的所有 Release...')
-          try:
-              cmd_list = ['gh', 'api', f'repos/{repo_path}/releases', '--paginate', '-q', '.[] | {id, tag_name}']
-              output = subprocess.check_output(cmd_list).decode()
-              
-              # 构建映射字典: {'CMFA-v2.8.0': 123456, ...}
-              # 注意：Draft 的 tag_name 就是我们在 create 时指定的 tag
-              release_map = {}
-              for line in output.strip().split('\n'):
-                  if not line: continue
-                  try:
-                      item = json.loads(line)
-                      if item.get('tag_name'):
-                          release_map[item['tag_name']] = item['id']
-                  except:
-                      pass
-                      
-              print(f'✅ 成功获取 {len(release_map)} 个 Release ID')
-              
-          except Exception as e:
-              print(f'❌ 获取 Release 列表失败: {e}')
-              exit(1)
-
-          # 🟢 2. 遍历并修正
-          for tag in target_tags:
-              new_tag = f'CMFA-{tag}'
-              
-              # 从映射表中直接查找 ID，不再调用 API 查找
-              release_id = release_map.get(new_tag)
-              
-              if not release_id:
-                  print(f'⚠️ 未找到 {new_tag} 的 ID (可能上传失败)，跳过')
-                  continue
-              
-              # 读取原始时间
-              try:
-                  with open(f'date_{tag}.txt', 'r') as df:
-                      orig_date = df.read().strip()
-              except:
-                  orig_date = None
-              
-              if not orig_date:
-                  print(f'⚠️ 缺少时间数据: {new_tag}')
-                  continue
-
-              # 决定 Latest
-              is_latest = 'true' if tag == king_tag else 'false'
-              
-              print(f'🔧 修正: {new_tag} (ID: {release_id}) -> {orig_date} [Latest: {is_latest}]')
-              
-              # 发送 PATCH
-              try:
-                  cmd_patch = [
-                      'gh', 'api', 
-                      '--method', 'PATCH', 
-                      f'repos/{repo_path}/releases/{release_id}',
-                      '-f', f'draft=false',
-                      '-f', f'published_at={orig_date}',
-                      '-f', f'make_latest={is_latest}'
-                  ]
-                  subprocess.check_call(cmd_patch, stdout=subprocess.DEVNULL)
-              except Exception as e:
-                  print(f'❌ 修正失败: {e}')
-                  
-              time.sleep(1)
-          "
-          
-          echo "🏁 完美收官！"
+          echo "🏁 搬运完成！"
