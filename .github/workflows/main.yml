@@ -1,4 +1,4 @@
-name: 2. 纯净搬运 (参数修复版)
+name: 2. 纯净搬运 (时间重置版)
 
 on:
   schedule:
@@ -6,23 +6,30 @@ on:
   workflow_dispatch:
 
 jobs:
-  syntax-fix-sync:
+  time-restore-sync:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # 必须有权限修改时间
     steps:
       - name: 初始化
         uses: actions/checkout@v4
 
-      - name: 1. 计算与拆分 (Python 排序)
+      - name: 1. 获取并计算列表
         env:
           GH_TOKEN: ${{ secrets.MY_PAT }}
           SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
         run: |
           mkdir -p download_temp
           
+          # 锁定当前仓库路径 (用于 API 调用)
+          MY_REPO=$(gh repo view --json owner,name -q ".owner.login + \"/\" + .name")
+          echo "REPO_PATH=$MY_REPO" >> $GITHUB_ENV
+          echo "📍 当前仓库: $MY_REPO"
+          
           echo "🔍 获取原始列表..."
           gh release list -R $SOURCE_REPO --limit 100 --json tagName -q '.[].tagName' | grep "^v" > raw.txt
           
-          echo "🧮 Python 严格排序..."
+          echo "🧮 Python 排序..."
           python3 -c "
           import sys
           lines = [l.strip() for l in open('raw.txt') if l.strip()]
@@ -31,105 +38,83 @@ jobs:
               return [int(x) for x in nums if x.isdigit()]
           lines.sort(key=sort_key)
           print('\n'.join(lines))
-          " > sorted_tags.txt
+          " > tags.txt
           
-          # 物理隔离：把“唯一的王”单独拿出来
-          tail -n 1 sorted_tags.txt > king.txt
-          head -n -1 sorted_tags.txt > commoners.txt
-          
-          KING=$(cat king.txt)
-          echo "========================================"
-          echo "👑 锁定的新王: $KING"
-          echo "👥 平民数量: $(wc -l < commoners.txt)"
-          echo "========================================"
+          KING_TAG=$(tail -n 1 tags.txt)
+          echo "KING_TAG=$KING_TAG" >> $GITHUB_ENV
+          echo "👑 锁定的新王: $KING_TAG"
 
-      - name: 2. 处理旧版本 (Commoners)
+      - name: 2. 搬运并通过 API 篡改时间
         env:
           GH_TOKEN: ${{ secrets.MY_PAT }}
           SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
         run: |
-          set +e # 允许部分报错继续执行
+          # 允许报错继续 (set +e)
+          set +e
           
-          TOTAL=$(wc -l < commoners.txt)
+          TOTAL=$(wc -l < tags.txt)
           CURRENT=0
-          
-          echo "🚀 开始搬运旧版本 (强制设为非 Latest)..."
           
           while read TAG; do
             CURRENT=$((CURRENT+1))
             NEW_TAG="CMFA-$TAG"
             
-            # 简单查重
-            if gh release view $NEW_TAG >/dev/null 2>&1; then
-               echo "⏭️ $NEW_TAG 已存在"
-               continue
-            fi
+            echo "----------------------------------------"
+            echo "🚀 [$CURRENT/$TOTAL] 处理: $TAG"
             
-            echo "Processing [$CURRENT/$TOTAL]: $TAG"
-            
-            # 抓取信息
+            # 1. 抓取原版时间 (关键!)
             gh release view $TAG -R $SOURCE_REPO --json publishedAt,body > meta.json
-            # 如果抓取失败，跳过
-            if [ $? -ne 0 ]; then continue; fi
-            
             ORIG_DATE=$(jq -r .publishedAt meta.json)
+            echo "📅 原版时间应为: $ORIG_DATE"
+            
+            # 准备日志
             NICE_DATE=$(date -d "$ORIG_DATE" +'%Y-%m-%d %H:%M')
             echo -e "### 📅 原版发布时间: **$NICE_DATE**\n\n---" > notes.md
             jq -r .body meta.json >> notes.md
             
-            # 下载
+            # 2. 判断是否最新
+            LATEST_FLAG="--latest=false"
+            if [ "$TAG" == "$KING_TAG" ]; then
+               LATEST_FLAG="--make-latest"
+               echo "👑 标记为最新版"
+            fi
+            
+            # 3. 下载
             rm -rf download_temp/*
             gh release download $TAG -R $SOURCE_REPO -D download_temp 2>/dev/null
             
-            # 📤 上传 (关键：--latest=false)
+            # 4. 创建 (先创建，时间默认是当前)
             if [ -n "$(ls -A download_temp 2>/dev/null)" ]; then
-               gh release create "$NEW_TAG" download_temp/* --title "CMFA: $TAG" -F notes.md --latest=false
+               gh release create "$NEW_TAG" download_temp/* --title "CMFA: $TAG" -F notes.md $LATEST_FLAG
             else
-               gh release create "$NEW_TAG" --title "CMFA: $TAG (无附件)" -F notes.md --latest=false
+               gh release create "$NEW_TAG" --title "CMFA: $TAG (无附件)" -F notes.md $LATEST_FLAG
             fi
             
-          done < commoners.txt
-          echo "✅ 旧版本全部处理完毕。"
-
-      - name: 3. 独家加冕 (The King)
-        env:
-          GH_TOKEN: ${{ secrets.MY_PAT }}
-          SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
-        run: |
-          KING_TAG=$(cat king.txt)
-          NEW_TAG="CMFA-$KING_TAG"
+            # 🟢 5. 核心大招：使用 API 强制改时间
+            # 只有改了时间，GitHub 才会把 2023 年的排在后面！
+            
+            echo "⏳ 正在查找 ID 以修正时间..."
+            # 尝试 5 次获取 ID
+            RELEASE_ID=""
+            for i in {1..5}; do
+               # 直接请求 API 获取 ID，比 gh release view 更准
+               RELEASE_ID=$(gh api "repos/$REPO_PATH/releases/tags/$NEW_TAG" --jq .id 2>/dev/null)
+               if [ -n "$RELEASE_ID" ]; then
+                  break
+               fi
+               sleep 2
+            done
+            
+            if [ -n "$RELEASE_ID" ]; then
+               echo "🔧 找到 ID: $RELEASE_ID -> 正在穿越回 $ORIG_DATE"
+               # 发送 PATCH 请求修改时间
+               gh api --method PATCH "repos/$REPO_PATH/releases/$RELEASE_ID" -f published_at="$ORIG_DATE"
+               echo "✅ 时间穿越成功！"
+            else
+               echo "⚠️ 警告: 无法获取 ID，时间未修正 (可能导致排序错误)"
+            fi
+            
+          done < tags.txt
           
-          echo "----------------------------------------"
-          echo "👑 正在迎接: $KING_TAG"
-          echo "----------------------------------------"
-          
-          # 准备信息
-          gh release view $KING_TAG -R $SOURCE_REPO --json publishedAt,body > meta.json
-          ORIG_DATE=$(jq -r .publishedAt meta.json)
-          NICE_DATE=$(date -d "$ORIG_DATE" +'%Y-%m-%d %H:%M')
-          echo -e "### 📅 原版发布时间: **$NICE_DATE**\n\n---" > notes.md
-          jq -r .body meta.json >> notes.md
-          
-          # 下载
-          rm -rf download_temp/*
-          gh release download $KING_TAG -R $SOURCE_REPO -D download_temp 2>/dev/null
-          
-          # 📤 上传并加冕
-          # 修复点：create 命令使用 --latest，edit 命令才用 --make-latest
-          
-          echo "⚡ 执行加冕..."
-          
-          if gh release view $NEW_TAG > /dev/null 2>&1; then
-             echo "⚠️ 版本已存在，执行强制修改..."
-             gh release edit "$NEW_TAG" --make-latest
-          else
-             if [ -n "$(ls -A download_temp 2>/dev/null)" ]; then
-                # 这里改成了 --latest (这才是 create 的正确参数)
-                gh release create "$NEW_TAG" download_temp/* --title "CMFA: $KING_TAG" -F notes.md --latest
-             else
-                gh release create "$NEW_TAG" --title "CMFA: $KING_TAG (无附件)" -F notes.md --latest
-             fi
-          fi
-          
-          echo "🎉 成功！$KING_TAG 现已是 Latest。"
-          rm -rf download_temp raw.txt sorted_tags.txt commoners.txt king.txt meta.json notes.md
+          rm -rf download_temp tags.txt raw.txt meta.json notes.md
+          echo "🏁 全部完成！"
