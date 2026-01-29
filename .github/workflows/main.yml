@@ -1,4 +1,4 @@
-name: 全量搬运 (无删除 | 自动过滤 | 强行置顶)
+name: 2.时光机搬运 (纯净版 - 无删除)
 
 on:
   schedule:
@@ -6,28 +6,34 @@ on:
   workflow_dispatch:        # 手动触发
 
 jobs:
-  mirror-safe:
+  time-machine-pure:
     runs-on: ubuntu-latest
     steps:
       - name: 初始化
         uses: actions/checkout@v4
 
-      - name: 执行搬运
+      - name: 执行排序搬运
         env:
           GH_TOKEN: ${{ secrets.MY_PAT }}
           SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
         run: |
           mkdir -p download_temp
           
-          echo "🔍 获取列表..."
-          # 1. 获取最近 100 个
-          # 2. grep "^v": 只保留 v 开头的正式版 (过滤掉 Prerelease)
-          # 3. sort -V: 按版本号从小到大排序，确保执行顺序正确
+          echo "🔍 获取列表并进行版本号排序..."
+          
+          # 1. grep "^v": 只保留 v 开头的正式版 (过滤 Prerelease)
+          # 2. sort -V: 按版本号从小到大排序 (v2.9 -> v2.11)
+          # 这样脚本会按顺序处理，保证新版本的时间戳永远晚于旧版本
           gh release list -R $SOURCE_REPO --limit 100 --json tagName -q '.[].tagName' \
             | grep "^v" \
             | sort -V > tags.txt
           
-          # 找出列表中版本号最大的一个，记下来
+          if [ ! -s tags.txt ]; then
+            echo "❌ 未找到有效版本！"
+            exit 1
+          fi
+          
+          # 提前锁定版本号最大的那个，作为 Latest 目标
           LATEST_TARGET=$(tail -n 1 tags.txt)
           echo "🎯 本次锁定的最新版本是: $LATEST_TARGET"
           
@@ -38,51 +44,54 @@ jobs:
             CURRENT=$((CURRENT+1))
             NEW_TAG="CMFA-$TAG"
             
-            # --- 查重逻辑 (安全的核心) ---
+            # --- 查重 (核心安全机制) ---
+            # 如果版本已存在，直接跳过，绝不覆盖或删除
             if gh release view $NEW_TAG > /dev/null 2>&1; then
               echo "[$CURRENT/$TOTAL] ✅ $NEW_TAG 已存在，跳过。"
               continue
             fi
             
             echo "----------------------------------------"
-            echo "🚀 [$CURRENT/$TOTAL] 发现新版本，开始搬运: $TAG"
+            echo "🚀 [$CURRENT/$TOTAL] 发现新版本，搬运中: $TAG"
             
-            # 抓取原版信息
-            if ! RAW_DATE=$(gh release view $TAG -R $SOURCE_REPO --json publishedAt -q .publishedAt 2>/dev/null); then
-               echo "⚠️ 无法读取 $TAG 信息，跳过"
-               continue
+            # 1. 抓取时间 (仅做日志展示)
+            RAW_DATE=$(gh release view $TAG -R $SOURCE_REPO --json publishedAt -q .publishedAt 2>/dev/null) || true
+            if [ -n "$RAW_DATE" ]; then
+                NICE_DATE=$(date -d "$RAW_DATE" +'%Y-%m-%d %H:%M')
+            else
+                NICE_DATE="Unknown"
             fi
-            NICE_DATE=$(date -d "$RAW_DATE" +'%Y-%m-%d %H:%M')
-            gh release view $TAG -R $SOURCE_REPO --json body -q .body > logs.txt
             
+            # 2. 准备日志
+            gh release view $TAG -R $SOURCE_REPO --json body -q .body > logs.txt
             echo -e "### 📅 原版发布时间: **$NICE_DATE**\n\n---" > notes.md
             cat logs.txt >> notes.md
             
-            # 下载
+            # 3. 下载
             rm -rf download_temp/*
             gh release download $TAG -R $SOURCE_REPO -D download_temp 2>/dev/null || true
             
-            # 上传
-            # 注意：这里统一设为 --latest=false，防止中间的版本抢了风头
+            # 4. 上传
+            # 哪怕这里不加 --latest，脚本最后一步也会修正
             if [ "$(ls -A download_temp)" ]; then
-               gh release create $NEW_TAG download_temp/* --title "CMFA: $TAG" -F notes.md --latest=false
+               gh release create $NEW_TAG download_temp/* --title "CMFA: $TAG" -F notes.md
             else
-               gh release create $NEW_TAG --title "CMFA: $TAG (无附件)" -F notes.md --latest=false
+               gh release create $NEW_TAG --title "CMFA: $TAG (无附件)" -F notes.md
             fi
             
-            # 稍微等待，确保创建时间有间隔
+            echo "✅ $NEW_TAG 完成"
+            
+            # 强制睡眠 2 秒，确保新版本在 GitHub 系统里的创建时间更晚
             sleep 2
             
           done < tags.txt
           
-          # --- 终极修正：强行指定 Latest ---
-          # 无论上面跳过了多少版本，最后都要把真正的“老大”设为 Latest
+          # --- 终极修正：无论前面跳过了多少，最后都要把皇冠给这一版 ---
           if [ ! -z "$LATEST_TARGET" ]; then
-            TARGET_TAG="CMFA-$LATEST_TARGET"
-            echo "👑 正在将 $TARGET_TAG 加冕为 Latest Release..."
-            # 使用 edit 命令修改属性
-            gh release edit "$TARGET_TAG" --make-latest
+            FINAL_TAG="CMFA-$LATEST_TARGET"
+            echo "👑 正在将 $FINAL_TAG 强制设为 Latest Release..."
+            gh release edit "$FINAL_TAG" --make-latest || echo "⚠️ 标记 Latest 失败，可能是该版本未成功创建"
           fi
           
           rm -rf download_temp tags.txt logs.txt notes.md
-          echo "🏁 所有任务完成！"
+          echo "🏁 搬运完成！"
