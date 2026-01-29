@@ -1,4 +1,4 @@
-name: 2. 纯净搬运 (预判加冕版)
+name: 2. 纯净搬运 (最终稳定版)
 
 on:
   schedule:
@@ -6,58 +6,38 @@ on:
   workflow_dispatch:
 
 jobs:
-  pre-calc-sync:
+  stable-sync:
     runs-on: ubuntu-latest
     steps:
       - name: 初始化
         uses: actions/checkout@v4
 
-      - name: 执行智能搬运
+      - name: 执行搬运
         env:
           GH_TOKEN: ${{ secrets.MY_PAT }}
           SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
         run: |
           mkdir -p download_temp
           
-          echo "🔍 1. 获取原始列表..."
-          # 获取列表，只保留 v 开头的正式版
+          echo "🔍 1. 获取列表..."
           gh release list -R $SOURCE_REPO --limit 100 --json tagName -q '.[].tagName' | grep "^v" > raw.txt
           
-          echo "🧮 2. 使用 Python 计算顺序和最终目标..."
-          
-          # --- Python 脚本：排序并找出 Latest ---
-          # 它会生成一个 tags.txt，最后一行就是最新的
+          echo "🧮 2. Python 排序 (v2.9 -> v2.11)..."
           python3 -c "
           import sys
-          
-          # 读取
           lines = [l.strip() for l in open('raw.txt') if l.strip()]
-          
-          # 排序逻辑：将 v2.11.9 转换为数字列表 [2, 11, 9]
-          # 这样 11 一定大于 9，绝对不会排错
+          # 排序: v2.11.9 -> [2, 11, 9]
           def sort_key(s):
-              # 去掉 v，去掉可能存在的后缀
               nums = s.lstrip('v').split('-')[0].split('.')
               return [int(x) for x in nums if x.isdigit()]
-          
           lines.sort(key=sort_key)
-          
-          # 打印排序后的列表
           print('\n'.join(lines))
           " > tags.txt
           
-          # 锁定列表中最后一个版本，它就是我们要找的 King
+          # 锁定最后一行 (最新版)
           KING_TAG=$(tail -n 1 tags.txt)
-          echo "========================================"
-          echo "🎯 锁定目标 (King): $KING_TAG"
-          echo "📊 搬运顺序: 先搬 $(head -n 1 tags.txt) -> ... -> 最后搬 $KING_TAG"
-          echo "========================================"
+          echo "🎯 锁定最新版 (King): $KING_TAG"
           
-          if [ -z "$KING_TAG" ]; then
-             echo "❌ 列表为空，终止！"
-             exit 1
-          fi
-
           TOTAL=$(wc -l < tags.txt)
           CURRENT=0
           
@@ -77,37 +57,39 @@ jobs:
             gh release view $TAG -R $SOURCE_REPO --json publishedAt,body > meta.json
             ORIG_DATE=$(jq -r .publishedAt meta.json)
             NICE_DATE=$(date -d "$ORIG_DATE" +'%Y-%m-%d %H:%M')
-            
             echo -e "### 📅 原版发布时间: **$NICE_DATE**\n\n---" > notes.md
             jq -r .body meta.json >> notes.md
             
-            # 2. 下载
+            # 2. 下载 (忽略错误)
             rm -rf download_temp/*
             gh release download $TAG -R $SOURCE_REPO -D download_temp 2>/dev/null || true
             
-            # 3. 判断是否为 King (最新版)
-            # 如果是 King -> 使用 --make-latest
-            # 如果不是 -> 使用 --latest=false
-            IS_LATEST_FLAG="--latest=false"
+            # 3. 决定身份 (是否为 King)
             if [ "$TAG" == "$KING_TAG" ]; then
-               echo "👑 当前处理的是最新版，准备加冕！"
-               IS_LATEST_FLAG="--make-latest"
+               LATEST_FLAG="--make-latest"
+               echo "👑 身份确认：这是最新版！"
+            else
+               LATEST_FLAG="--latest=false"
             fi
             
-            # 4. 上传 (根据上面的判断，自动带上正确的 flag)
-            # 使用 check 检查文件是否存在，避免报错
-            if ls download_temp/* 1> /dev/null 2>&1; then
-               gh release create $NEW_TAG download_temp/* --title "CMFA: $TAG" -F notes.md $IS_LATEST_FLAG
+            # 4. 上传 (关键修复：严谨判断文件是否存在)
+            # 使用 ls -A 判断目录是否为空
+            if [ -n "$(ls -A download_temp 2>/dev/null)" ]; then
+               # 有文件 -> 带文件上传
+               echo "📂 发现附件，正在上传..."
+               gh release create "$NEW_TAG" download_temp/* --title "CMFA: $TAG" -F notes.md $LATEST_FLAG
             else
-               gh release create $NEW_TAG --title "CMFA: $TAG (无附件)" -F notes.md $IS_LATEST_FLAG
+               # 无文件 -> 纯文本发布 (防止崩溃!)
+               echo "⚠️ 无附件，仅创建 Release..."
+               gh release create "$NEW_TAG" --title "CMFA: $TAG (无附件)" -F notes.md $LATEST_FLAG
             fi
             
             echo "✅ $NEW_TAG 完成"
             
-            # 睡眠 5 秒 (辅助 GitHub 列表排序)
-            sleep 5
+            # 睡眠 3 秒
+            sleep 3
             
           done < tags.txt
           
           rm -rf download_temp tags.txt raw.txt meta.json notes.md
-          echo "🏁 完美结束！$KING_TAG 应该是 Latest。"
+          echo "🏁 搬运完成！"
