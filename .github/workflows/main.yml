@@ -1,4 +1,4 @@
-name: 2. 纯净搬运 (时光倒流修正版)
+name: 2. 纯净搬运 (ID修正时光机)
 
 on:
   schedule:
@@ -6,10 +6,10 @@ on:
   workflow_dispatch:
 
 jobs:
-  time-travel-sync:
+  time-travel-id-fix:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # 需要写入权限来修改 Release 时间
+      contents: write # 必须有写入权限
     steps:
       - name: 初始化
         uses: actions/checkout@v4
@@ -19,13 +19,14 @@ jobs:
           GH_TOKEN: ${{ secrets.MY_PAT }}
           SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
         run: |
-          # 获取当前仓库的身份 (例如 User/Repo)
+          # 1. 获取当前仓库的 owner/repo 格式
           MY_REPO=$(gh repo view --json owner,name -q ".owner.login + \"/\" + .name")
-          echo "📍 当前仓库: $MY_REPO"
+          echo "📍 锁定当前仓库: $MY_REPO"
           
           mkdir -p download_temp
           
-          echo "🔍 获取列表 (顺序已经不重要了，因为我们会强制修正时间)..."
+          echo "🔍 获取原始列表..."
+          # 获取列表，只保留 v 开头
           gh release list -R $SOURCE_REPO --limit 100 --json tagName -q '.[].tagName' | grep "^v" > tags.txt
           
           TOTAL=$(wc -l < tags.txt)
@@ -41,14 +42,14 @@ jobs:
               continue
             fi
             
+            echo "----------------------------------------"
             echo "🚀 [$CURRENT/$TOTAL] 正在搬运: $TAG"
             
-            # 1. 抓取原版精确时间 (ISO 8601 格式)
+            # 1. 抓取原版精确时间
             gh release view $TAG -R $SOURCE_REPO --json publishedAt,body > meta.json
             ORIG_DATE=$(jq -r .publishedAt meta.json)
-            
-            # 准备日志
             NICE_DATE=$(date -d "$ORIG_DATE" +'%Y-%m-%d %H:%M')
+            
             echo -e "### 📅 原版发布时间: **$NICE_DATE**\n\n---" > notes.md
             jq -r .body meta.json >> notes.md
             
@@ -56,27 +57,31 @@ jobs:
             rm -rf download_temp/*
             gh release download $TAG -R $SOURCE_REPO -D download_temp 2>/dev/null || true
             
-            # 3. 创建发布 (此时时间是“现在”，顺序可能是乱的)
+            # 3. 创建发布 (此时时间是“现在”)
             if [ "$(ls -A download_temp)" ]; then
                gh release create $NEW_TAG download_temp/* --title "CMFA: $TAG" -F notes.md --latest=false
             else
                gh release create $NEW_TAG --title "CMFA: $TAG (无附件)" -F notes.md --latest=false
             fi
             
-            # 🟢 4. 核心必杀技：使用 API 强制把时间改回原版时间！
-            # 这样 GitHub 就必须按 2023、2024、2025 的真实时间轴排序
-            echo "🔧 正在将时间修正为: $ORIG_DATE"
-            gh api --method PATCH "/repos/$MY_REPO/releases/tags/$NEW_TAG" -f published_at="$ORIG_DATE"
+            # 🟢 4. 核心修正：获取 Release ID 并通过 ID 修改时间
+            # 这是解决 404 错误的唯一办法
+            echo "🔍 正在查询 $NEW_TAG 的唯一 ID..."
+            RELEASE_ID=$(gh release view "$NEW_TAG" --json databaseId -q .databaseId)
+            
+            echo "🔧 正在将 ID:$RELEASE_ID 的时间修正为: $ORIG_DATE"
+            gh api --method PATCH "/repos/$MY_REPO/releases/$RELEASE_ID" -f published_at="$ORIG_DATE"
             
             echo "✅ $NEW_TAG 完成 (时间已穿越)"
             
           done < tags.txt
           
-          # --- 5. 最后修正 Latest ---
-          # 由于时间已经修正，GitHub 其实会自动识别最新的，但我们还是强制标记一下最晚的那个
+          # --- 5. 自动加冕最新版 ---
+          # 由于我们恢复了真实时间，GitHub 应该能自动识别，但为了保险还是手动标记一下
+          echo "👑 正在刷新 Latest 状态..."
           LATEST_TAG=$(gh release list --limit 1 --exclude-drafts --exclude-pre-releases --json tagName -q '.[0].tagName')
           if [ ! -z "$LATEST_TAG" ]; then
-             echo "👑 自动检测到最新版是 $LATEST_TAG，正在加冕..."
+             echo "🎯 检测到最新版是 $LATEST_TAG，正在加冕..."
              gh release edit "$LATEST_TAG" --make-latest || true
           fi
           
