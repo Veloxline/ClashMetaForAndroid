@@ -1,4 +1,4 @@
-name: 2. 纯净搬运 (原子修复版)
+name: 2. 纯净搬运 (全量检索修复版)
 
 on:
   schedule:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  atomic-restore-sync:
+  list-match-sync:
     runs-on: ubuntu-latest
     permissions:
       contents: write # 必须有权限修改 Release
@@ -14,7 +14,7 @@ jobs:
       - name: 初始化
         uses: actions/checkout@v4
 
-      - name: 1. 准备清单与环境
+      - name: 1. 准备清单
         env:
           GH_TOKEN: ${{ secrets.MY_PAT }}
           SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
@@ -71,7 +71,7 @@ jobs:
             gh release view $TAG -R $SOURCE_REPO --json publishedAt,body > meta.json
             if [ $? -ne 0 ]; then continue; fi
             
-            # 保存原始时间到文件，供下一步使用
+            # 保存原始时间到文件
             ORIG_DATE=$(jq -r .publishedAt meta.json)
             echo "$ORIG_DATE" > "date_$TAG.txt"
             
@@ -81,7 +81,7 @@ jobs:
             rm -rf download_temp/*
             gh release download $TAG -R $SOURCE_REPO -D download_temp 2>/dev/null
             
-            # 上传为 Draft
+            # 上传为 Draft (注意：此时没有 Tag，GitHub 会分配一个 untagged-xxxx)
             if [ -n "$(ls -A download_temp 2>/dev/null)" ]; then
                gh release create "$NEW_TAG" download_temp/* --title "CMFA: $TAG" -F notes.md --draft
             else
@@ -90,14 +90,14 @@ jobs:
             
           done < tags.txt
           
-          echo "✅ 所有草稿上传完毕。休息 10 秒等待数据库同步..."
-          sleep 10
+          echo "✅ 草稿上传完毕。休息 5 秒..."
+          sleep 5
 
-      - name: 3.【原子发布】API 强制修正
+      - name: 3.【发布】全量检索并修正
         env:
           GH_TOKEN: ${{ secrets.MY_PAT }}
         run: |
-          # 使用 Python 处理 API 请求，比 Shell 更稳定
+          # 使用 Python 处理复杂逻辑
           python3 -c "
           import os
           import subprocess
@@ -107,73 +107,78 @@ jobs:
           repo_path = os.environ['REPO_PATH']
           king_tag = os.environ['KING_TAG']
           
-          # 读取 tags
+          # 读取目标 tags
           with open('tags.txt', 'r') as f:
-              tags = [line.strip() for line in f if line.strip()]
+              target_tags = [line.strip() for line in f if line.strip()]
           
-          print(f'🚀 开始原子发布流程，目标仓库: {repo_path}')
-          print(f'👑 King Tag: {king_tag}')
+          print(f'🚀 开始检索修复流程...')
           
-          for tag in tags:
+          # 🟢 1. 获取当前仓库所有 Releases (包括 Drafts)
+          # 这是修复 404 错误的关键！我们要一次性拉取所有 ID
+          print(f'🔍 拉取 {repo_path} 的所有 Release...')
+          try:
+              cmd_list = ['gh', 'api', f'repos/{repo_path}/releases', '--paginate', '-q', '.[] | {id, tag_name}']
+              output = subprocess.check_output(cmd_list).decode()
+              
+              # 构建映射字典: {'CMFA-v2.8.0': 123456, ...}
+              # 注意：Draft 的 tag_name 就是我们在 create 时指定的 tag
+              release_map = {}
+              for line in output.strip().split('\n'):
+                  if not line: continue
+                  try:
+                      item = json.loads(line)
+                      if item.get('tag_name'):
+                          release_map[item['tag_name']] = item['id']
+                  except:
+                      pass
+                      
+              print(f'✅ 成功获取 {len(release_map)} 个 Release ID')
+              
+          except Exception as e:
+              print(f'❌ 获取 Release 列表失败: {e}')
+              exit(1)
+
+          # 🟢 2. 遍历并修正
+          for tag in target_tags:
               new_tag = f'CMFA-{tag}'
+              
+              # 从映射表中直接查找 ID，不再调用 API 查找
+              release_id = release_map.get(new_tag)
+              
+              if not release_id:
+                  print(f'⚠️ 未找到 {new_tag} 的 ID (可能上传失败)，跳过')
+                  continue
               
               # 读取原始时间
               try:
                   with open(f'date_{tag}.txt', 'r') as df:
                       orig_date = df.read().strip()
               except:
-                  print(f'⚠️ 无法找到 {tag} 的时间文件，跳过')
+                  orig_date = None
+              
+              if not orig_date:
+                  print(f'⚠️ 缺少时间数据: {new_tag}')
                   continue
-              
-              print(f'--------------------------------')
-              print(f'🔧 处理: {new_tag} (目标时间: {orig_date})')
-              
-              # 1. 获取 Release ID (带重试)
-              release_id = None
-              for i in range(5):
-                  try:
-                      cmd = ['gh', 'api', f'repos/{repo_path}/releases/tags/{new_tag}', '--jq', '.id']
-                      result = subprocess.check_output(cmd).decode().strip()
-                      if result:
-                          release_id = result
-                          break
-                  except:
-                      pass
-                  time.sleep(2)
-              
-              if not release_id:
-                  print(f'❌ 无法获取 ID: {new_tag}')
-                  continue
-                  
-              # 2. 构造 API Payload
-              # 决定是否为 latest
+
+              # 决定 Latest
               is_latest = 'true' if tag == king_tag else 'false'
               
-              # 核心：在一个请求里同时改状态和改时间
-              # 注意：API 参数 make_latest 接受 'true'/'false'/'legacy'
-              payload = {
-                  'draft': False,
-                  'published_at': orig_date,
-                  'make_latest': str(is_latest).lower()
-              }
+              print(f'🔧 修正: {new_tag} (ID: {release_id}) -> {orig_date} [Latest: {is_latest}]')
               
-              # 3. 发送 PATCH 请求
+              # 发送 PATCH
               try:
-                  # gh api 接受 json 字段
                   cmd_patch = [
                       'gh', 'api', 
                       '--method', 'PATCH', 
                       f'repos/{repo_path}/releases/{release_id}',
                       '-f', f'draft=false',
                       '-f', f'published_at={orig_date}',
-                      '-f', f'make_latest={str(is_latest).lower()}'
+                      '-f', f'make_latest={is_latest}'
                   ]
                   subprocess.check_call(cmd_patch, stdout=subprocess.DEVNULL)
-                  print(f'✅ 原子发布成功！Draft->Public, Time->{orig_date}, Latest->{is_latest}')
               except Exception as e:
-                  print(f'❌ API 请求失败: {e}')
+                  print(f'❌ 修正失败: {e}')
                   
-              # 小间隔
               time.sleep(1)
           "
           
