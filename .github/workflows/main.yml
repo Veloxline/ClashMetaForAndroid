@@ -1,4 +1,4 @@
-name: 全量档案馆 (完美排序版)
+name: 2. 完美排序搬运 (Final Sort)
 
 on:
   schedule:
@@ -6,83 +6,67 @@ on:
   workflow_dispatch:
 
 jobs:
-  archive-sorted:
+  mirror-sorted:
     runs-on: ubuntu-latest
     steps:
-      - name: 1. 初始化 Git 环境
+      - name: 初始化
         uses: actions/checkout@v4
 
-      - name: 2. 执行倒序搬运
+      - name: 执行倒序搬运
         env:
           GH_TOKEN: ${{ secrets.MY_PAT }}
           SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
         run: |
           mkdir -p download_temp
           
-          echo "🔍 正在连接 $SOURCE_REPO ..."
-          
-          # 【核心修改 1】在最后加了 | tac
-          # 作用：把列表反转 (Oldest -> Newest)
-          # 这样脚本会先创建旧版，最后创建新版。
-          # 结果：GitHub 会认为新版是“刚刚更新的”，把它排在最上面！
+          echo "🔍 连接原仓库并获取倒序列表..."
+          # 获取列表并反转 (旧 -> 新)
           gh release list -R $SOURCE_REPO --limit 100 --json tagName -q '.[].tagName' | tac > tags.txt
           
-          # 调试信息
           TOTAL=$(wc -l < tags.txt)
-          echo "📊 抓取到 $TOTAL 个版本 (已反转顺序)"
+          echo "📊 共发现 $TOTAL 个版本，开始搬运..."
           
-          if [ ! -s tags.txt ]; then
-            echo "❌ 列表为空，请检查网络或 Token。"
-            exit 1
-          fi
-          
-          # 循环计数器
           CURRENT=0
-          
           while read TAG; do
             CURRENT=$((CURRENT+1))
             NEW_TAG="CMFA-$TAG"
             
-            # 查重
+            # 查重 (如果已存在则跳过)
             if gh release view $NEW_TAG > /dev/null 2>&1; then
-              echo "[$CURRENT/$TOTAL] ✅ $NEW_TAG 已存在，跳过。"
-              continue
+               echo "[$CURRENT/$TOTAL] ✅ $NEW_TAG 已存在，跳过。"
+               continue
             fi
-            
+
             echo "----------------------------------------"
-            echo "🚀 [$CURRENT/$TOTAL] 正在搬运: $TAG"
+            echo "🚀 [$CURRENT/$TOTAL] 处理中: $TAG"
             
-            # 抓取信息
+            # 1. 抓取元数据
             if ! RAW_DATE=$(gh release view $TAG -R $SOURCE_REPO --json publishedAt -q .publishedAt 2>/dev/null); then
-               echo "⚠️ 原版信息读取失败，跳过..."
+               echo "⚠️ 无法读取信息，跳过..."
                continue
             fi
             NICE_DATE=$(date -d "$RAW_DATE" +'%Y-%m-%d %H:%M')
             gh release view $TAG -R $SOURCE_REPO --json body -q .body > logs.txt
             
-            # 写入日志
             echo -e "### 📅 原版发布时间: **$NICE_DATE**\n\n---" > notes.md
             cat logs.txt >> notes.md
             
-            # 下载
+            # 2. 下载
             rm -rf download_temp/*
             gh release download $TAG -R $SOURCE_REPO -D download_temp 2>/dev/null || true
             
-            # 上传
+            # 3. 上传
             if [ "$(ls -A download_temp)" ]; then
                gh release create $NEW_TAG download_temp/* --title "CMFA: $TAG" -F notes.md
-               echo "🎉 成功！"
             else
                gh release create $NEW_TAG --title "CMFA: $TAG (无附件)" -F notes.md
-               echo "⚠️ 无附件版本归档。"
             fi
             
-            # 稍微睡1秒，确保 GitHub 服务器记录的时间戳有明显间隔
+            echo "🎉 完成！"
+            # 暂停1秒确保顺序
             sleep 1
-            
-            rm -f notes.md logs.txt
             
           done < tags.txt
           
-          rm -rf download_temp tags.txt
-          echo "🏁 完美排序搬运完成！"
+          rm -rf download_temp tags.txt logs.txt notes.md
+          echo "🏁 全部完成！"
