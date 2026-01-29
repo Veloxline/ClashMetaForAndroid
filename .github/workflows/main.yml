@@ -1,4 +1,4 @@
-name: 2. 纯净搬运 (智能纠错版)
+name: 2. 纯净搬运 (时光倒流修正版)
 
 on:
   schedule:
@@ -6,67 +6,28 @@ on:
   workflow_dispatch:
 
 jobs:
-  smart-mirror:
+  time-travel-sync:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # 需要写入权限来修改 Release 时间
     steps:
       - name: 初始化
         uses: actions/checkout@v4
 
-      - name: 执行智能搬运
+      - name: 执行搬运并篡改时间
         env:
           GH_TOKEN: ${{ secrets.MY_PAT }}
           SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
         run: |
+          # 获取当前仓库的身份 (例如 User/Repo)
+          MY_REPO=$(gh repo view --json owner,name -q ".owner.login + \"/\" + .name")
+          echo "📍 当前仓库: $MY_REPO"
+          
           mkdir -p download_temp
           
-          echo "🔍 获取原始版本列表..."
-          # 获取列表，过滤 v 开头的正式版
-          gh release list -R $SOURCE_REPO --limit 100 --json tagName -q '.[].tagName' | grep "^v" > raw.txt
+          echo "🔍 获取列表 (顺序已经不重要了，因为我们会强制修正时间)..."
+          gh release list -R $SOURCE_REPO --limit 100 --json tagName -q '.[].tagName' | grep "^v" > tags.txt
           
-          echo "🧠 正在进行智能顺序检测与修正..."
-          
-          # --- Python 智能脚本 ---
-          python3 -c "
-          import sys
-          
-          # 1. 读取并清理空白符
-          lines = [l.strip() for l in open('raw.txt') if l.strip()]
-          
-          # 2. 定义版本解析函数 (将 v2.11.9 -> [2, 11, 9])
-          def parse_ver(v):
-              clean = v.lstrip('v').split('-')[0] # 去掉 v 和后缀
-              return [int(x) for x in clean.split('.') if x.isdigit()]
-          
-          # 3. 强制从小到大排序 (Old -> New)
-          # 不管输入是什么顺序，这里统一重新排一遍
-          lines.sort(key=parse_ver)
-          
-          # 4. 最终检查 (双重保险)
-          if lines:
-              first = lines[0]  #应该是旧的 (2.9)
-              last = lines[-1]  #应该是新的 (2.11)
-              # 如果排序失败导致 2.11 在前面，这里可以打印警告(通常 sort 不会错)
-              sys.stderr.write(f'DEBUG: List starts with {first}, ends with {last}\n')
-          
-          # 5. 输出最终列表
-          print('\n'.join(lines))
-          " > tags.txt
-          
-          # --- 🚨 关键验证：请在运行日志中看这一段 ---
-          echo "========================================"
-          echo "📊 最终执行顺序 (必须是 v2.9 在前，v2.11 在后):"
-          echo "➡️ 第一步搬运: $(head -n 1 tags.txt)"
-          echo "..."
-          echo "➡️ 最后一步搬运: $(tail -n 1 tags.txt)"
-          echo "========================================"
-          
-          if [ ! -s tags.txt ]; then
-             echo "❌ 错误：版本列表为空！"
-             exit 1
-          fi
-
-          # 锁定最后一个版本 (最新版)
-          LATEST_TARGET=$(tail -n 1 tags.txt)
           TOTAL=$(wc -l < tags.txt)
           CURRENT=0
           
@@ -82,11 +43,12 @@ jobs:
             
             echo "🚀 [$CURRENT/$TOTAL] 正在搬运: $TAG"
             
-            # 1. 抓取日志
+            # 1. 抓取原版精确时间 (ISO 8601 格式)
             gh release view $TAG -R $SOURCE_REPO --json publishedAt,body > meta.json
-            RAW_DATE=$(jq -r .publishedAt meta.json)
-            NICE_DATE=$(date -d "$RAW_DATE" +'%Y-%m-%d %H:%M')
+            ORIG_DATE=$(jq -r .publishedAt meta.json)
             
+            # 准备日志
+            NICE_DATE=$(date -d "$ORIG_DATE" +'%Y-%m-%d %H:%M')
             echo -e "### 📅 原版发布时间: **$NICE_DATE**\n\n---" > notes.md
             jq -r .body meta.json >> notes.md
             
@@ -94,26 +56,29 @@ jobs:
             rm -rf download_temp/*
             gh release download $TAG -R $SOURCE_REPO -D download_temp 2>/dev/null || true
             
-            # 3. 上传 (先不设 Latest)
+            # 3. 创建发布 (此时时间是“现在”，顺序可能是乱的)
             if [ "$(ls -A download_temp)" ]; then
                gh release create $NEW_TAG download_temp/* --title "CMFA: $TAG" -F notes.md --latest=false
             else
                gh release create $NEW_TAG --title "CMFA: $TAG (无附件)" -F notes.md --latest=false
             fi
             
-            echo "✅ $NEW_TAG 完成"
+            # 🟢 4. 核心必杀技：使用 API 强制把时间改回原版时间！
+            # 这样 GitHub 就必须按 2023、2024、2025 的真实时间轴排序
+            echo "🔧 正在将时间修正为: $ORIG_DATE"
+            gh api --method PATCH "/repos/$MY_REPO/releases/tags/$NEW_TAG" -f published_at="$ORIG_DATE"
             
-            # 🟢 睡眠 3 秒 (确保 v2.11 是最后创建的)
-            sleep 3
+            echo "✅ $NEW_TAG 完成 (时间已穿越)"
             
           done < tags.txt
           
-          # --- 终极修正：把皇冠给最后处理的那个 ---
-          if [ ! -z "$LATEST_TARGET" ]; then
-             FINAL_TAG="CMFA-$LATEST_TARGET"
-             echo "👑 正在将最后搬运的 $FINAL_TAG 设为 Latest..."
-             gh release edit "$FINAL_TAG" --make-latest || true
+          # --- 5. 最后修正 Latest ---
+          # 由于时间已经修正，GitHub 其实会自动识别最新的，但我们还是强制标记一下最晚的那个
+          LATEST_TAG=$(gh release list --limit 1 --exclude-drafts --exclude-pre-releases --json tagName -q '.[0].tagName')
+          if [ ! -z "$LATEST_TAG" ]; then
+             echo "👑 自动检测到最新版是 $LATEST_TAG，正在加冕..."
+             gh release edit "$LATEST_TAG" --make-latest || true
           fi
           
-          rm -rf download_temp tags.txt raw.txt meta.json notes.md
-          echo "🏁 搬运完成！"
+          rm -rf download_temp tags.txt meta.json notes.md
+          echo "🏁 完美收官！"
