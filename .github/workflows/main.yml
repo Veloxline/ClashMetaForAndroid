@@ -1,4 +1,4 @@
-name: 2. 完美排序 (慢速稳健版)
+name: 2. 完美排序 (数学排序版)
 
 on:
   schedule:
@@ -6,33 +6,34 @@ on:
   workflow_dispatch:
 
 jobs:
-  mirror-slow-sort:
+  mirror-math-sort:
     runs-on: ubuntu-latest
     steps:
       - name: 初始化
         uses: actions/checkout@v4
 
-      - name: 执行倒序搬运
+      - name: 执行排序搬运
         env:
           GH_TOKEN: ${{ secrets.MY_PAT }}
           SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
         run: |
           mkdir -p download_temp
           
-          echo "🔍 获取列表并进行倒序处理..."
+          echo "🔍 获取列表并进行【版本号排序】..."
           
-          # 1. 获取原始列表 (新 -> 旧)
-          # 2. 用 tac 反转 (旧 -> 新)
-          gh release list -R $SOURCE_REPO --limit 100 --json tagName -q '.[].tagName' | tac > tags.txt
+          # 【核心修改】
+          # 1. 获取 Tag 列表
+          # 2. 使用 sort -V (版本排序) 强制从小到大排列 (v2.9 -> v2.10 -> v2.11)
+          # 这样脚本就会先创建旧版，最后创建新版。
+          gh release list -R $SOURCE_REPO --limit 100 --json tagName -q '.[].tagName' | sort -V > tags.txt
           
-          # --- 调试：打印一下顺序给您看 ---
-          echo "📊 搬运计划 (前3个):"
+          # --- 调试：打印计划 ---
+          echo "📊 搬运顺序预演 (前3个 - 最先创建，沉底):"
           head -n 3 tags.txt
           echo "..."
-          echo "📊 搬运计划 (最后3个 - 这些应该显示在Releases最上面):"
+          echo "📊 搬运顺序预演 (后3个 - 最后创建，置顶):"
           tail -n 3 tags.txt
           echo "----------------------------------------"
-          # ---------------------------
           
           TOTAL=$(wc -l < tags.txt)
           CURRENT=0
@@ -73,12 +74,10 @@ jobs:
             
             echo "✅ 完成 $TAG"
             
-            # 🟢 【关键】强制睡眠 2 秒
-            # 这能保证下一个版本的“发布时间”绝对比这个晚
-            # 从而确保 GitHub 排序正确
+            # 强制睡眠 2 秒，确保时间戳不重复
             sleep 2
             
           done < tags.txt
           
           rm -rf download_temp tags.txt logs.txt notes.md
-          echo "🏁 搬运完成！去 Releases 页面看看吧，这次一定对！"
+          echo "🏁 搬运完成！这次顺序绝对是数学级准确的！"
