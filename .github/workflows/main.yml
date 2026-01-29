@@ -1,4 +1,4 @@
-name: 2. 纯净搬运 (2.10+ 版本)
+name: 2. 纯净搬运 (美学修正版)
 
 on:
   schedule:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  filter-sync:
+  aesthetic-sync:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -14,7 +14,7 @@ jobs:
       - name: 初始化
         uses: actions/checkout@v4
 
-      - name: 1. 获取并筛选列表 (2.10+)
+      - name: 1. 筛选 >= v2.10.0
         env:
           GH_TOKEN: ${{ secrets.MY_PAT }}
           SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
@@ -24,24 +24,17 @@ jobs:
           echo "🔍 获取全量列表..."
           gh release list -R $SOURCE_REPO --limit 100 --json tagName -q '.[].tagName' | grep "^v" > raw.txt
           
-          echo "✂️ 正在筛选 >= v2.10.0 的版本..."
-          
-          # --- Python 筛选脚本 ---
+          # --- Python 筛选 & 排序 ---
           python3 -c "
           import sys
           
-          # 读取
           lines = [l.strip() for l in open('raw.txt') if l.strip()]
-          
           filtered = []
           for tag in lines:
-              # 解析版本号: v2.11.22 -> [2, 11, 22]
-              # 移除 'v' 和可能的后缀
               clean_v = tag.lstrip('v').split('-')[0]
               try:
                   parts = [int(x) for x in clean_v.split('.') if x.isdigit()]
-                  
-                  # 核心过滤逻辑: 主版本>2 或 (主版本=2 且 次版本>=10)
+                  # 逻辑: >= 2.10.0
                   if len(parts) >= 2:
                       major, minor = parts[0], parts[1]
                       if major > 2 or (major == 2 and minor >= 10):
@@ -49,35 +42,25 @@ jobs:
               except:
                   continue
           
-          # 排序: 从旧到新 (v2.10.0 -> v2.11.22)
+          # 排序: 旧 -> 新
           def sort_key(s):
               nums = s.lstrip('v').split('-')[0].split('.')
               return [int(x) for x in nums if x.isdigit()]
           
           filtered.sort(key=sort_key)
-          
-          # 输出
           print('\n'.join(filtered))
           " > tags.txt
           
-          # 锁定最新的 King
+          # 锁定 King
           KING_TAG=$(tail -n 1 tags.txt)
           echo "KING_TAG=$KING_TAG" >> $GITHUB_ENV
-          
-          COUNT=$(wc -l < tags.txt)
-          echo "========================================"
-          echo "📊 筛选结果: 共 $COUNT 个版本"
-          echo "➡️ 起点: $(head -n 1 tags.txt)"
-          echo "➡️ 终点 (King): $KING_TAG"
-          echo "========================================"
 
-      - name: 2. 执行搬运
+      - name: 2. 执行搬运 (美化处理)
         env:
           GH_TOKEN: ${{ secrets.MY_PAT }}
           SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
         run: |
           set +e
-          
           TOTAL=$(wc -l < tags.txt)
           CURRENT=0
           
@@ -87,44 +70,49 @@ jobs:
             
             # 查重
             if gh release view $NEW_TAG > /dev/null 2>&1; then
-               echo "⏭️ $NEW_TAG 已存在，跳过"
+               echo "⏭️ $NEW_TAG 已存在"
                continue
             fi
             
             echo "🚀 [$CURRENT/$TOTAL] 处理: $TAG"
             
-            # 抓取日志
+            # 抓取信息
             gh release view $TAG -R $SOURCE_REPO --json publishedAt,body > meta.json
             if [ $? -ne 0 ]; then continue; fi
             
-            # 生成 Note (保留原版时间文字，但不以此为排序依据)
-            ORIG_DATE=$(jq -r .publishedAt meta.json)
-            echo -e "### 📅 原版发布时间: **$ORIG_DATE**\n\n---" > notes.md
+            # --- 🟢 核心美化区 ---
+            
+            # 1. 时间格式化
+            RAW_DATE=$(jq -r .publishedAt meta.json)
+            # date 命令: 确保日期和时间中间有空格 (YYYY-MM-DD HH:MM:SS)
+            PRETTY_DATE=$(date -d "$RAW_DATE" +'%Y-%m-%d %H:%M:%S')
+            
+            # 2. 生成说明书 (Note)
+            # 去掉了 '### 📅' 这种大标题和图标
+            # 改为更精致的加粗文本，不仅好看，而且不占地方
+            echo -e "**原版发布时间:** $PRETTY_DATE\n\n---" > notes.md
             jq -r .body meta.json >> notes.md
             
             # 下载
             rm -rf download_temp/*
             gh release download $TAG -R $SOURCE_REPO -D download_temp 2>/dev/null
             
-            # 决定 Latest 状态
-            # 如果是 King -> Latest=true
-            # 其他 -> Latest=false
+            # 决定是否 Latest
             if [ "$TAG" == "$KING_TAG" ]; then
                LATEST_FLAG="--latest"
-               echo "👑 它是最新版！"
             else
                LATEST_FLAG="--latest=false"
             fi
             
-            # 上传 (直接创建，依赖脚本的运行顺序 2.10 -> 2.11)
-            # GitHub 默认把最后创建的视为最新，配合 --latest 标记双重保险
+            # 3. 标题美化 (去掉 CMFA: 前缀)
+            # 使用 "$TAG" 作为标题 (例如 "v2.11.9")
             if [ -n "$(ls -A download_temp 2>/dev/null)" ]; then
-               gh release create "$NEW_TAG" download_temp/* --title "CMFA: $TAG" -F notes.md $LATEST_FLAG
+               gh release create "$NEW_TAG" download_temp/* --title "$TAG" -F notes.md $LATEST_FLAG
             else
-               gh release create "$NEW_TAG" --title "CMFA: $TAG (无附件)" -F notes.md $LATEST_FLAG
+               gh release create "$NEW_TAG" --title "$TAG (无附件)" -F notes.md $LATEST_FLAG
             fi
             
-            # 休息 3 秒，确保创建时间有先后
+            # 休息 3 秒确保排序
             sleep 3
             
           done < tags.txt
