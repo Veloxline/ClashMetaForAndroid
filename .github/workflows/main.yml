@@ -1,39 +1,35 @@
-name: 2. 完美排序 (数学排序版)
+name: 全量搬运 (无删除 | 自动过滤 | 强行置顶)
 
 on:
   schedule:
-    - cron: '0 */12 * * *'
-  workflow_dispatch:
+    - cron: '0 */12 * * *'  # 每天跑两次
+  workflow_dispatch:        # 手动触发
 
 jobs:
-  mirror-math-sort:
+  mirror-safe:
     runs-on: ubuntu-latest
     steps:
       - name: 初始化
         uses: actions/checkout@v4
 
-      - name: 执行排序搬运
+      - name: 执行搬运
         env:
           GH_TOKEN: ${{ secrets.MY_PAT }}
           SOURCE_REPO: MetaCubeX/ClashMetaForAndroid
         run: |
           mkdir -p download_temp
           
-          echo "🔍 获取列表并进行【版本号排序】..."
+          echo "🔍 获取列表..."
+          # 1. 获取最近 100 个
+          # 2. grep "^v": 只保留 v 开头的正式版 (过滤掉 Prerelease)
+          # 3. sort -V: 按版本号从小到大排序，确保执行顺序正确
+          gh release list -R $SOURCE_REPO --limit 100 --json tagName -q '.[].tagName' \
+            | grep "^v" \
+            | sort -V > tags.txt
           
-          # 【核心修改】
-          # 1. 获取 Tag 列表
-          # 2. 使用 sort -V (版本排序) 强制从小到大排列 (v2.9 -> v2.10 -> v2.11)
-          # 这样脚本就会先创建旧版，最后创建新版。
-          gh release list -R $SOURCE_REPO --limit 100 --json tagName -q '.[].tagName' | sort -V > tags.txt
-          
-          # --- 调试：打印计划 ---
-          echo "📊 搬运顺序预演 (前3个 - 最先创建，沉底):"
-          head -n 3 tags.txt
-          echo "..."
-          echo "📊 搬运顺序预演 (后3个 - 最后创建，置顶):"
-          tail -n 3 tags.txt
-          echo "----------------------------------------"
+          # 找出列表中版本号最大的一个，记下来
+          LATEST_TARGET=$(tail -n 1 tags.txt)
+          echo "🎯 本次锁定的最新版本是: $LATEST_TARGET"
           
           TOTAL=$(wc -l < tags.txt)
           CURRENT=0
@@ -42,17 +38,18 @@ jobs:
             CURRENT=$((CURRENT+1))
             NEW_TAG="CMFA-$TAG"
             
-            # 查重
+            # --- 查重逻辑 (安全的核心) ---
             if gh release view $NEW_TAG > /dev/null 2>&1; then
-               echo "[$CURRENT/$TOTAL] ✅ $NEW_TAG 已存在，跳过。"
-               continue
+              echo "[$CURRENT/$TOTAL] ✅ $NEW_TAG 已存在，跳过。"
+              continue
             fi
-
-            echo "🚀 [$CURRENT/$TOTAL] 正在搬运: $TAG"
             
-            # 1. 抓取信息
+            echo "----------------------------------------"
+            echo "🚀 [$CURRENT/$TOTAL] 发现新版本，开始搬运: $TAG"
+            
+            # 抓取原版信息
             if ! RAW_DATE=$(gh release view $TAG -R $SOURCE_REPO --json publishedAt -q .publishedAt 2>/dev/null); then
-               echo "⚠️ 信息读取失败，跳过..."
+               echo "⚠️ 无法读取 $TAG 信息，跳过"
                continue
             fi
             NICE_DATE=$(date -d "$RAW_DATE" +'%Y-%m-%d %H:%M')
@@ -61,23 +58,31 @@ jobs:
             echo -e "### 📅 原版发布时间: **$NICE_DATE**\n\n---" > notes.md
             cat logs.txt >> notes.md
             
-            # 2. 下载
+            # 下载
             rm -rf download_temp/*
             gh release download $TAG -R $SOURCE_REPO -D download_temp 2>/dev/null || true
             
-            # 3. 上传
+            # 上传
+            # 注意：这里统一设为 --latest=false，防止中间的版本抢了风头
             if [ "$(ls -A download_temp)" ]; then
-               gh release create $NEW_TAG download_temp/* --title "CMFA: $TAG" -F notes.md
+               gh release create $NEW_TAG download_temp/* --title "CMFA: $TAG" -F notes.md --latest=false
             else
-               gh release create $NEW_TAG --title "CMFA: $TAG (无附件)" -F notes.md
+               gh release create $NEW_TAG --title "CMFA: $TAG (无附件)" -F notes.md --latest=false
             fi
             
-            echo "✅ 完成 $TAG"
-            
-            # 强制睡眠 2 秒，确保时间戳不重复
+            # 稍微等待，确保创建时间有间隔
             sleep 2
             
           done < tags.txt
           
+          # --- 终极修正：强行指定 Latest ---
+          # 无论上面跳过了多少版本，最后都要把真正的“老大”设为 Latest
+          if [ ! -z "$LATEST_TARGET" ]; then
+            TARGET_TAG="CMFA-$LATEST_TARGET"
+            echo "👑 正在将 $TARGET_TAG 加冕为 Latest Release..."
+            # 使用 edit 命令修改属性
+            gh release edit "$TARGET_TAG" --make-latest
+          fi
+          
           rm -rf download_temp tags.txt logs.txt notes.md
-          echo "🏁 搬运完成！这次顺序绝对是数学级准确的！"
+          echo "🏁 所有任务完成！"
