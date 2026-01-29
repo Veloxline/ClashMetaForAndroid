@@ -1,4 +1,4 @@
-name: 2.时光机搬运 (纯净版 - 无删除)
+name: 2. 纯净搬运 (只建不删 | 完美排序)
 
 on:
   schedule:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:        # 手动触发
 
 jobs:
-  time-machine-pure:
+  pure-sync:
     runs-on: ubuntu-latest
     steps:
       - name: 初始化
@@ -19,21 +19,22 @@ jobs:
         run: |
           mkdir -p download_temp
           
-          echo "🔍 获取列表并进行版本号排序..."
+          echo "🔍 获取列表并进行数学排序..."
           
-          # 1. grep "^v": 只保留 v 开头的正式版 (过滤 Prerelease)
-          # 2. sort -V: 按版本号从小到大排序 (v2.9 -> v2.11)
-          # 这样脚本会按顺序处理，保证新版本的时间戳永远晚于旧版本
+          # 1. grep "^v": 只保留 v 开头的正式版 (过滤掉 Prerelease)
+          # 2. sort -V: 关键！按版本号从小到大排序 (v2.9 -> v2.10 -> v2.11)
+          #    这样脚本会先创建旧版，最后创建新版。
           gh release list -R $SOURCE_REPO --limit 100 --json tagName -q '.[].tagName' \
             | grep "^v" \
             | sort -V > tags.txt
           
+          # 检查列表
           if [ ! -s tags.txt ]; then
-            echo "❌ 未找到有效版本！"
+            echo "❌ 未获取到版本列表，请检查网络或 Token。"
             exit 1
           fi
           
-          # 提前锁定版本号最大的那个，作为 Latest 目标
+          # 锁定列表中最后一个版本 (也就是版本号最大的)
           LATEST_TARGET=$(tail -n 1 tags.txt)
           echo "🎯 本次锁定的最新版本是: $LATEST_TARGET"
           
@@ -44,17 +45,16 @@ jobs:
             CURRENT=$((CURRENT+1))
             NEW_TAG="CMFA-$TAG"
             
-            # --- 查重 (核心安全机制) ---
-            # 如果版本已存在，直接跳过，绝不覆盖或删除
+            # --- 查重 (遇到已存在的直接跳过，不碰它) ---
             if gh release view $NEW_TAG > /dev/null 2>&1; then
               echo "[$CURRENT/$TOTAL] ✅ $NEW_TAG 已存在，跳过。"
               continue
             fi
             
             echo "----------------------------------------"
-            echo "🚀 [$CURRENT/$TOTAL] 发现新版本，搬运中: $TAG"
+            echo "🚀 [$CURRENT/$TOTAL] 正在搬运: $TAG"
             
-            # 1. 抓取时间 (仅做日志展示)
+            # 1. 抓取时间 (仅做展示)
             RAW_DATE=$(gh release view $TAG -R $SOURCE_REPO --json publishedAt -q .publishedAt 2>/dev/null) || true
             if [ -n "$RAW_DATE" ]; then
                 NICE_DATE=$(date -d "$RAW_DATE" +'%Y-%m-%d %H:%M')
@@ -71,27 +71,27 @@ jobs:
             rm -rf download_temp/*
             gh release download $TAG -R $SOURCE_REPO -D download_temp 2>/dev/null || true
             
-            # 4. 上传
-            # 哪怕这里不加 --latest，脚本最后一步也会修正
+            # 4. 上传 (不指定 latest，依靠时间戳排序)
             if [ "$(ls -A download_temp)" ]; then
-               gh release create $NEW_TAG download_temp/* --title "CMFA: $TAG" -F notes.md
+               gh release create $NEW_TAG download_temp/* --title "CMFA: $TAG" -F notes.md --latest=false
             else
-               gh release create $NEW_TAG --title "CMFA: $TAG (无附件)" -F notes.md
+               gh release create $NEW_TAG --title "CMFA: $TAG (无附件)" -F notes.md --latest=false
             fi
             
             echo "✅ $NEW_TAG 完成"
             
-            # 强制睡眠 2 秒，确保新版本在 GitHub 系统里的创建时间更晚
-            sleep 2
+            # 🟢 关键：强制睡眠 3 秒
+            # 确保下一个版本的创建时间比这个晚
+            sleep 3
             
           done < tags.txt
           
-          # --- 终极修正：无论前面跳过了多少，最后都要把皇冠给这一版 ---
+          # --- 终极修正：给最新版加冕 ---
           if [ ! -z "$LATEST_TARGET" ]; then
             FINAL_TAG="CMFA-$LATEST_TARGET"
-            echo "👑 正在将 $FINAL_TAG 强制设为 Latest Release..."
-            gh release edit "$FINAL_TAG" --make-latest || echo "⚠️ 标记 Latest 失败，可能是该版本未成功创建"
+            echo "👑 正在将 $FINAL_TAG 标记为 Latest..."
+            gh release edit "$FINAL_TAG" --make-latest || echo "⚠️ 标记失败，可能是该版本未被创建"
           fi
           
           rm -rf download_temp tags.txt logs.txt notes.md
-          echo "🏁 搬运完成！"
+          echo "🏁 所有任务完成！"
